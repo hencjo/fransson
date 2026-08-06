@@ -161,7 +161,7 @@ Keep `fransson.yaml`, its state file, and archives in the project working direct
 
 ## Configuration reference
 
-All commands use the same strict YAML schema. Unknown fields, obsolete names, conflicting modes, and invalid combinations fail loudly. See [`config.example.yaml`](config.example.yaml) for the complete authenticated example and [`config.no-auth-dst.example.yaml`](config.no-auth-dst.example.yaml) for a destination without authentication.
+All commands use the same strict YAML schema. Unknown fields, obsolete names, conflicting modes, and invalid combinations fail loudly. See [`config.example.yaml`](examples/config.example.yaml) for the complete authenticated example and [`config.no-auth-dst.example.yaml`](examples/config.no-auth-dst.example.yaml) for a destination without authentication.
 
 ```yaml
 state_file: .state/fransson.json

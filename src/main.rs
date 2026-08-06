@@ -2929,8 +2929,8 @@ topics:
     #[test]
     fn published_examples_match_the_strict_schema() {
         for yaml in [
-            include_str!("../config.example.yaml"),
-            include_str!("../config.no-auth-dst.example.yaml"),
+            include_str!("../examples/config.example.yaml"),
+            include_str!("../examples/config.no-auth-dst.example.yaml"),
         ] {
             let config: AppConfig = serde_yaml::from_str(yaml).unwrap();
             validate_config(&config).unwrap();
