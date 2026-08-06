@@ -1,0 +1,70 @@
+state_file: .state/fransson.json
+
+sources:
+  primary:
+    bootstrap_servers: localhost:9092
+    client_id: fransson-primary
+    group_id: fransson-primary
+    max_in_flight_per_partition: 64
+    security_protocol: SASL_SSL
+    sasl:
+      mechanism: PLAIN
+      username: source-user
+      password_env: PRIMARY_KAFKA_PASSWORD
+    properties:
+      fetch.wait.max.ms: "50"
+
+destination:
+  bootstrap_servers: localhost:9093
+  client_id: fransson-destination
+  security_protocol: SASL_SSL
+  sasl:
+    mechanism: PLAIN
+    username: destination-user
+    password_env: DESTINATION_KAFKA_PASSWORD
+
+topics:
+  # Clone a compacted topic from its earliest offset and persist progress.
+  - name: orders.v1.backup
+    replication_factor: 3
+    config:
+      cleanup.policy: compact
+      retention.ms: "-1"
+      max.message.bytes: "10485760"
+    clone:
+      source: primary:orders.v1
+
+  # Copy only records produced while `fransson run` is active.
+  - name: payments.v1.live
+    config:
+      cleanup.policy: delete
+      retention.ms: "604800000"
+      max.message.bytes: "10485760"
+    stream:
+      source: primary:payments.v1
+
+  # Restore a deterministic archive. Its partition count comes from the file.
+  - name: orders.v1.restored
+    force: true
+    config:
+      cleanup.policy: compact
+      retention.ms: "-1"
+    restore:
+      archive: orders.fransson.zst
+
+  # Manage topic shape while preserving contents when no recreation is needed.
+  - name: scratch.events
+    config:
+      cleanup.policy: delete
+      retention.ms: "604800000"
+    manage:
+      partitions: 3
+
+  # Guarantee an empty topic after every restore or run reconciliation.
+  - name: disposable.events
+    force: true
+    config:
+      cleanup.policy: delete
+      retention.ms: "604800000"
+    empty:
+      partitions: 3

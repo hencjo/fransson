@@ -1,0 +1,32 @@
+state_file: .state/fransson.json
+
+sources:
+  primary:
+    bootstrap_servers: localhost:9092
+    client_id: fransson-primary
+    group_id: fransson-primary
+    security_protocol: SASL_SSL
+    sasl:
+      mechanism: PLAIN
+      username: source-user
+      password_env: PRIMARY_KAFKA_PASSWORD
+
+destination:
+  bootstrap_servers: localhost:9093
+  client_id: fransson-destination
+
+topics:
+  - name: orders.v1.backup
+    config:
+      cleanup.policy: compact
+      retention.ms: "-1"
+      max.message.bytes: "10485760"
+    clone:
+      source: primary:orders.v1
+
+  - name: payments.v1.live
+    config:
+      cleanup.policy: delete
+      retention.ms: "604800000"
+    stream:
+      source: primary:payments.v1
