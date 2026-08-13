@@ -261,6 +261,8 @@ Missing destination topics are created normally. An existing topic is drifted wh
 
 Fransson preflights every destination before changing anything. Required recreation fails safely unless the topic has `force: true` or the invocation uses `--force`. Authorization deletes and recreates the destination topic, clears its state, and reapplies its configured data mode. **This destroys existing destination data.**
 
+Destructive reconciliation requires exclusive ownership of the destination topic. Stop producers, consumers, and Kafka Streams applications that can reference it, or disable broker-side topic auto-creation first. If another client recreates the topic between Fransson's delete and create operations, Fransson fails rather than accepting a topic whose identity and contents it does not control.
+
 An `empty` topic is reset once during every `restore` invocation and every `run` startup; Fransson does not keep it empty after applications begin writing. A configuration containing only `manage` or `empty` topics must use `restore`, because `run` requires at least one active clone or stream.
 
 Application writes after a completed restore do not count as drift and do not trigger another restore. If a restore fails partway through, its completion marker is absent; the next reconciliation requires force before recreating the partial destination and trying again.

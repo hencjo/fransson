@@ -15,6 +15,13 @@ git diff --check
 
 The Nix version must match `Cargo.toml`.
 
+The ignored reconciliation tests require a disposable Kafka 4.2.0 broker and delete the uniquely named topics they create:
+
+```bash
+FRANSSON_TEST_KAFKA_BOOTSTRAP_SERVERS=localhost:9092 \
+  cargo test kafka_reconciliation_ -- --ignored --nocapture
+```
+
 Keep `README.md`, this guide, and the files under `examples/` accurate when changing public behavior.
 
 ## Commits and versions

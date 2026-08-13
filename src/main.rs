@@ -17,6 +17,7 @@ use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{
     stream_consumer::StreamPartitionQueue, Consumer, DefaultConsumerContext, StreamConsumer,
 };
+use rdkafka::error::RDKafkaErrorCode;
 use rdkafka::message::{Header, Headers, Message, OwnedHeaders, OwnedMessage};
 use rdkafka::metadata::{Metadata, MetadataTopic};
 use rdkafka::producer::{FutureProducer, FutureRecord};
@@ -31,6 +32,8 @@ mod archive;
 use archive::{ArchiveEvent, ArchiveHeader, ArchiveReader, ArchiveRecord, ArchiveWriter};
 
 const SOURCE_REF_DELIMITER: &str = ":";
+const TOPIC_RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(30);
+const TOPIC_RECONCILIATION_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -1831,6 +1834,10 @@ async fn reconcile_destination_topics(
 
     for plan in plans {
         let topic = &topics[plan.topic_index];
+        let recreation_deadline = match plan.action {
+            ReconcileAction::Recreate(_) => Some(Instant::now() + TOPIC_RECONCILIATION_TIMEOUT),
+            ReconcileAction::None | ReconcileAction::Create => None,
+        };
         match plan.action {
             ReconcileAction::None => continue,
             ReconcileAction::Create => {
@@ -1838,14 +1845,28 @@ async fn reconcile_destination_topics(
             }
             ReconcileAction::Recreate(_) => {
                 clear_topic_state(runtime, &topic.name).await?;
-                delete_destination_topic(&admin_client, &metadata_consumer, &topic.name).await?;
+                delete_destination_topic(
+                    &admin_client,
+                    &metadata_consumer,
+                    &topic.name,
+                    recreation_deadline.expect("recreation action has a deadline"),
+                )
+                .await?;
             }
         }
-        create_destination_topic(&admin_client, topic, plan.desired_partitions).await?;
+        create_destination_topic(
+            &admin_client,
+            &metadata_consumer,
+            topic,
+            plan.desired_partitions,
+            recreation_deadline,
+        )
+        .await?;
         wait_for_destination_topic_state(
             &metadata_consumer,
             &topic.name,
             Some(plan.desired_partitions),
+            recreation_deadline.unwrap_or_else(|| Instant::now() + TOPIC_RECONCILIATION_TIMEOUT),
         )
         .await?;
 
@@ -1922,9 +1943,14 @@ async fn delete_destination_topic(
     admin_client: &AdminClient<DefaultClientContext>,
     metadata_consumer: &StreamConsumer,
     topic: &str,
+    deadline: Instant,
 ) -> Result<()> {
+    let timeout = remaining_reconciliation_time(deadline, topic)?;
+    let options = AdminOptions::new()
+        .request_timeout(Some(timeout))
+        .operation_timeout(Some(timeout));
     let results = admin_client
-        .delete_topics(&[topic], &AdminOptions::new())
+        .delete_topics(&[topic], &options)
         .await
         .with_context(|| format!("failed to delete destination topic {topic}"))?;
     match results.into_iter().next() {
@@ -1932,13 +1958,15 @@ async fn delete_destination_topic(
         Some(Err((name, code))) => bail!("failed to delete destination topic {name}: {code}"),
         None => bail!("Kafka returned no delete result for destination topic {topic}"),
     }
-    wait_for_destination_topic_state(metadata_consumer, topic, None).await
+    wait_for_destination_topic_state(metadata_consumer, topic, None, deadline).await
 }
 
 async fn create_destination_topic(
     admin_client: &AdminClient<DefaultClientContext>,
+    metadata_consumer: &StreamConsumer,
     topic: &ManagedTopic,
     partitions: i32,
+    recreation_deadline: Option<Instant>,
 ) -> Result<()> {
     let mut new_topic = NewTopic::new(
         topic.name.as_str(),
@@ -1949,38 +1977,129 @@ async fn create_destination_topic(
     for (key, value) in &topic.config {
         new_topic = new_topic.set(key, value);
     }
-    let results = admin_client
-        .create_topics([&new_topic], &AdminOptions::new())
-        .await
-        .with_context(|| format!("failed to create destination topic {}", topic.name))?;
-    match results.into_iter().next() {
-        Some(Ok(_)) => Ok(()),
-        Some(Err((name, code))) => bail!("failed to create destination topic {name}: {code}"),
-        None => bail!(
-            "Kafka returned no create result for destination topic {}",
-            topic.name
-        ),
+    loop {
+        let options = if let Some(deadline) = recreation_deadline {
+            let timeout = remaining_reconciliation_time(deadline, &topic.name)?;
+            AdminOptions::new()
+                .request_timeout(Some(timeout))
+                .operation_timeout(Some(timeout))
+        } else {
+            AdminOptions::new()
+        };
+        let results = admin_client
+            .create_topics([&new_topic], &options)
+            .await
+            .with_context(|| format!("failed to create destination topic {}", topic.name))?;
+        match results.into_iter().next() {
+            Some(Ok(_)) => return Ok(()),
+            Some(Err((name, RDKafkaErrorCode::TopicAlreadyExists)))
+                if recreation_deadline.is_some() =>
+            {
+                let deadline = recreation_deadline.expect("guarded by is_some");
+                match create_collision_action(destination_topic_presence(
+                    metadata_consumer,
+                    &topic.name,
+                    deadline,
+                )?) {
+                    CreateCollisionAction::FailConcurrent => bail!(
+                        "destination topic {name} was recreated by another client during reconciliation; stop destination applications or disable Kafka topic auto-creation before retrying"
+                    ),
+                    CreateCollisionAction::Retry => {
+                        sleep_until_reconciliation_retry(deadline, &topic.name).await?;
+                    }
+                }
+            }
+            Some(Err((name, code))) => {
+                bail!("failed to create destination topic {name}: {code}")
+            }
+            None => bail!(
+                "Kafka returned no create result for destination topic {}",
+                topic.name
+            ),
+        }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DestinationTopicPresence {
+    Missing,
+    Live,
+    Errored,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreateCollisionAction {
+    Retry,
+    FailConcurrent,
+}
+
+fn create_collision_action(presence: DestinationTopicPresence) -> CreateCollisionAction {
+    match presence {
+        DestinationTopicPresence::Missing | DestinationTopicPresence::Errored => {
+            CreateCollisionAction::Retry
+        }
+        DestinationTopicPresence::Live => CreateCollisionAction::FailConcurrent,
+    }
+}
+
+fn classify_destination_topic_presence(found: bool, has_error: bool) -> DestinationTopicPresence {
+    match (found, has_error) {
+        (false, _) => DestinationTopicPresence::Missing,
+        (true, false) => DestinationTopicPresence::Live,
+        (true, true) => DestinationTopicPresence::Errored,
+    }
+}
+
+fn destination_topic_presence(
+    metadata_consumer: &StreamConsumer,
+    topic: &str,
+    deadline: Instant,
+) -> Result<DestinationTopicPresence> {
+    let timeout = remaining_reconciliation_time(deadline, topic)?.min(Duration::from_secs(2));
+    let metadata = metadata_consumer
+        .fetch_metadata(None, timeout)
+        .with_context(|| format!("failed to refresh destination metadata for {topic}"))?;
+    let metadata_topic = metadata.topics().iter().find(|item| item.name() == topic);
+    Ok(classify_destination_topic_presence(
+        metadata_topic.is_some(),
+        metadata_topic.and_then(MetadataTopic::error).is_some(),
+    ))
+}
+
+fn remaining_reconciliation_time(deadline: Instant, topic: &str) -> Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .ok_or_else(|| anyhow!("timed out reconciling destination topic {topic}"))
+}
+
+async fn sleep_until_reconciliation_retry(deadline: Instant, topic: &str) -> Result<()> {
+    let remaining = remaining_reconciliation_time(deadline, topic)?;
+    tokio::time::sleep(remaining.min(TOPIC_RECONCILIATION_POLL_INTERVAL)).await;
+    remaining_reconciliation_time(deadline, topic).map(|_| ())
 }
 
 async fn wait_for_destination_topic_state(
     metadata_consumer: &StreamConsumer,
     topic: &str,
     expected_partitions: Option<i32>,
+    deadline: Instant,
 ) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
+        let timeout = remaining_reconciliation_time(deadline, topic)?.min(Duration::from_secs(2));
         let metadata = metadata_consumer
-            .fetch_metadata(None, Duration::from_secs(2))
+            .fetch_metadata(None, timeout)
             .with_context(|| format!("failed to refresh destination metadata for {topic}"))?;
-        let live_partitions = metadata
-            .topics()
-            .iter()
-            .find(|item| item.name() == topic && item.error().is_none())
+        let metadata_topic = metadata.topics().iter().find(|item| item.name() == topic);
+        let presence = classify_destination_topic_presence(
+            metadata_topic.is_some(),
+            metadata_topic.and_then(MetadataTopic::error).is_some(),
+        );
+        let live_partitions = metadata_topic
+            .filter(|_| presence == DestinationTopicPresence::Live)
             .map(|item| item.partitions().len() as i32);
         let ready = match expected_partitions {
             Some(expected) => live_partitions == Some(expected),
-            None => live_partitions.is_none(),
+            None => presence == DestinationTopicPresence::Missing,
         };
         if ready {
             return Ok(());
@@ -1993,7 +2112,7 @@ async fn wait_for_destination_topic_state(
                 None => bail!("timed out waiting for destination topic {topic} to be deleted"),
             }
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        sleep_until_reconciliation_retry(deadline, topic).await?;
     }
 }
 
@@ -2924,6 +3043,168 @@ topics:
         assert!(!recreation_authorized(false, false));
         assert!(recreation_authorized(true, false));
         assert!(recreation_authorized(false, true));
+    }
+
+    #[test]
+    fn destination_topic_presence_distinguishes_errors_from_deletion() {
+        assert_eq!(
+            classify_destination_topic_presence(false, false),
+            DestinationTopicPresence::Missing
+        );
+        assert_eq!(
+            classify_destination_topic_presence(true, false),
+            DestinationTopicPresence::Live
+        );
+        assert_eq!(
+            classify_destination_topic_presence(true, true),
+            DestinationTopicPresence::Errored
+        );
+        assert_eq!(
+            create_collision_action(DestinationTopicPresence::Missing),
+            CreateCollisionAction::Retry
+        );
+        assert_eq!(
+            create_collision_action(DestinationTopicPresence::Errored),
+            CreateCollisionAction::Retry
+        );
+        assert_eq!(
+            create_collision_action(DestinationTopicPresence::Live),
+            CreateCollisionAction::FailConcurrent
+        );
+    }
+
+    fn integration_destination_config() -> DestinationKafkaConfig {
+        DestinationKafkaConfig {
+            bootstrap_servers: env::var("FRANSSON_TEST_KAFKA_BOOTSTRAP_SERVERS")
+                .expect("set FRANSSON_TEST_KAFKA_BOOTSTRAP_SERVERS to run this test"),
+            client_id: Some("fransson-reconciliation-test".to_owned()),
+            security_protocol: None,
+            sasl: None,
+            properties: BTreeMap::new(),
+        }
+    }
+
+    fn integration_topic(prefix: &str) -> String {
+        format!(
+            "fransson-{prefix}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    }
+
+    fn empty_managed_topic(name: String) -> ManagedTopic {
+        ManagedTopic {
+            name,
+            force: true,
+            replication_factor: Some(1),
+            config: BTreeMap::from([("retention.ms".to_owned(), "120000".to_owned())]),
+            static_topic: Some(StaticTopicPlan {
+                partitions: 6,
+                kind: StaticTopicKind::Empty,
+            }),
+            transfer: None,
+            restore: None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires FRANSSON_TEST_KAFKA_BOOTSTRAP_SERVERS pointing at Kafka 4.2.0"]
+    async fn kafka_reconciliation_repeatedly_recreates_forced_topic() {
+        let config = integration_destination_config();
+        let admin = build_admin_client(&config).unwrap();
+        let metadata = build_consumer_for_destination_metadata(&config).unwrap();
+        let topic = empty_managed_topic(integration_topic("recreate"));
+
+        create_destination_topic(&admin, &metadata, &topic, 1, None)
+            .await
+            .unwrap();
+        wait_for_destination_topic_state(
+            &metadata,
+            &topic.name,
+            Some(1),
+            Instant::now() + TOPIC_RECONCILIATION_TIMEOUT,
+        )
+        .await
+        .unwrap();
+
+        for _ in 0..25 {
+            let deadline = Instant::now() + TOPIC_RECONCILIATION_TIMEOUT;
+            delete_destination_topic(&admin, &metadata, &topic.name, deadline)
+                .await
+                .unwrap();
+            create_destination_topic(&admin, &metadata, &topic, 6, Some(deadline))
+                .await
+                .unwrap();
+            wait_for_destination_topic_state(&metadata, &topic.name, Some(6), deadline)
+                .await
+                .unwrap();
+
+            let live_metadata = metadata
+                .fetch_metadata(Some(&topic.name), Duration::from_secs(5))
+                .unwrap();
+            let live_topic = live_metadata
+                .topics()
+                .iter()
+                .find(|candidate| candidate.name() == topic.name)
+                .unwrap();
+            assert_eq!(live_topic.partitions().len(), 6);
+            assert_eq!(
+                topic_mismatch_reason(&admin, &topic, 6, live_topic)
+                    .await
+                    .unwrap(),
+                None
+            );
+        }
+
+        delete_destination_topic(
+            &admin,
+            &metadata,
+            &topic.name,
+            Instant::now() + TOPIC_RECONCILIATION_TIMEOUT,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires FRANSSON_TEST_KAFKA_BOOTSTRAP_SERVERS pointing at Kafka 4.2.0"]
+    async fn kafka_reconciliation_rejects_concurrent_topic_recreation() {
+        let config = integration_destination_config();
+        let admin = build_admin_client(&config).unwrap();
+        let competing_admin = build_admin_client(&config).unwrap();
+        let metadata = build_consumer_for_destination_metadata(&config).unwrap();
+        let topic = empty_managed_topic(integration_topic("concurrent-recreate"));
+
+        create_destination_topic(&admin, &metadata, &topic, 1, None)
+            .await
+            .unwrap();
+        let deadline = Instant::now() + TOPIC_RECONCILIATION_TIMEOUT;
+        delete_destination_topic(&admin, &metadata, &topic.name, deadline)
+            .await
+            .unwrap();
+        create_destination_topic(&competing_admin, &metadata, &topic, 1, None)
+            .await
+            .unwrap();
+        wait_for_destination_topic_state(&metadata, &topic.name, Some(1), deadline)
+            .await
+            .unwrap();
+
+        let error = create_destination_topic(&admin, &metadata, &topic, 6, Some(deadline))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("recreated by another client"));
+
+        delete_destination_topic(
+            &admin,
+            &metadata,
+            &topic.name,
+            Instant::now() + TOPIC_RECONCILIATION_TIMEOUT,
+        )
+        .await
+        .unwrap();
     }
 
     #[test]
