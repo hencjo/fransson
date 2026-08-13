@@ -1,0 +1,184 @@
+name: Release artifacts
+
+on:
+  release:
+    types:
+      - published
+  workflow_run:
+    workflows:
+      - Release-plz
+    types:
+      - completed
+    branches:
+      - master
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Git tag for an existing GitHub release
+        required: true
+
+jobs:
+  linux-x86_64:
+    name: Build Linux x86_64 GNU
+    runs-on: ubuntu-22.04
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    permissions:
+      contents: write
+    env:
+      BIN: fransson
+      PACKAGE_PLATFORM: linux-x86_64-gnu
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.release.tag_name || github.event.inputs.tag || github.event.workflow_run.head_sha || github.sha }}
+          persist-credentials: false
+
+      - name: Resolve release artifact
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          tag="${EVENT_TAG:-}"
+          if [[ -z "${tag}" ]]; then
+            tag="${INPUT_TAG:-}"
+          fi
+          manifest_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+
+          if [[ -z "${tag}" ]]; then
+            version="${manifest_version}"
+            tag="${BIN}-v${version}"
+          else
+            version="${tag#"$BIN"-v}"
+          fi
+
+          if [[ "${tag}" != "${BIN}-v${version}" || -z "${version}" ]]; then
+            echo "Expected tag ${BIN}-v<version>, got ${tag}." >&2
+            exit 1
+          fi
+          if [[ "${version}" != "${manifest_version}" ]]; then
+            echo "Tag version ${version} does not match Cargo.toml version ${manifest_version}." >&2
+            exit 1
+          fi
+
+          package="${BIN}-${version}-${PACKAGE_PLATFORM}"
+          archive="${package}.tar.gz"
+          checksum="${archive}.sha256"
+
+          if ! gh release view "${tag}" >/dev/null 2>&1; then
+            if [[ "${GITHUB_EVENT_NAME}" == "workflow_run" ]]; then
+              echo "No GitHub release ${tag}; skipping artifact build."
+              echo "skip=true" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+            echo "GitHub release ${tag} does not exist." >&2
+            exit 1
+          fi
+
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_run" ]] && \
+            gh release view "${tag}" --json assets --jq '.assets[].name' | grep -Fxq "${archive}" && \
+            gh release view "${tag}" --json assets --jq '.assets[].name' | grep -Fxq "${checksum}"; then
+            echo "Release ${tag} already has ${archive} and ${checksum}; skipping."
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          {
+            echo "tag=${tag}"
+            echo "version=${version}"
+            echo "package=${package}"
+            echo "archive=${archive}"
+            echo "checksum=${checksum}"
+            echo "skip=false"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Install Rust toolchain
+        if: steps.release.outputs.skip != 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install native build dependencies
+        if: steps.release.outputs.skip != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential cmake libsasl2-dev pkg-config zlib1g-dev
+
+      - name: Build release binary
+        if: steps.release.outputs.skip != 'true'
+        run: cargo build --release --locked
+
+      - name: Verify dynamic dependencies
+        if: steps.release.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          deps="$(ldd "target/release/${BIN}")"
+          printf '%s\n' "${deps}"
+          if grep -Fq 'not found' <<< "${deps}"; then
+            echo "Release binary has missing dynamic dependencies." >&2
+            exit 1
+          fi
+
+          unexpected="$(
+            awk '/=>/ { print $1 }' <<< "${deps}" |
+              grep -Ev '^(libc|libdl|libgcc_s|libm|libpthread|libresolv|librt|libsasl2|libz)\.so(\.|$)' || true
+          )"
+          if [[ -n "${unexpected}" ]]; then
+            echo "Undeclared dynamic dependencies:" >&2
+            printf '%s\n' "${unexpected}" >&2
+            exit 1
+          fi
+
+      - name: Package artifact
+        if: steps.release.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "dist/pkg/${{ steps.release.outputs.package }}"
+          cp "target/release/${BIN}" "dist/pkg/${{ steps.release.outputs.package }}/"
+          cp README.md LICENSE "dist/pkg/${{ steps.release.outputs.package }}/"
+          cp -R examples "dist/pkg/${{ steps.release.outputs.package }}/"
+          tar \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            -C dist/pkg \
+            -czf "dist/${{ steps.release.outputs.archive }}" \
+            "${{ steps.release.outputs.package }}"
+          (cd dist && sha256sum "${{ steps.release.outputs.archive }}" > "${{ steps.release.outputs.checksum }}")
+
+      - name: Smoke-test packaged binary
+        if: steps.release.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker run --rm \
+            -v "${PWD}/dist/pkg/${{ steps.release.outputs.package }}:/artifact:ro" \
+            ubuntu:22.04 \
+            bash -ec 'apt-get update >/dev/null && apt-get install --yes libsasl2-2 libsasl2-modules zlib1g >/dev/null && /artifact/fransson --version'
+
+      - name: Upload workflow artifact
+        if: steps.release.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.release.outputs.archive }}
+          path: |
+            dist/${{ steps.release.outputs.archive }}
+            dist/${{ steps.release.outputs.checksum }}
+
+      - name: Upload release artifact
+        if: steps.release.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ steps.release.outputs.tag }}" \
+            "dist/${{ steps.release.outputs.archive }}" \
+            "dist/${{ steps.release.outputs.checksum }}" \
+            --clobber

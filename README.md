@@ -39,6 +39,25 @@ nix build github:hencjo/fransson#fransson
 
 The examples below use `fransson` for readability; replace it with `nix run github:hencjo/fransson --` if it is not on your `PATH`.
 
+### GNU/Linux release archive
+
+GitHub releases also provide an `x86_64` GNU/Linux archive and SHA-256 checksum:
+
+```text
+fransson-<version>-linux-x86_64-gnu.tar.gz
+fransson-<version>-linux-x86_64-gnu.tar.gz.sha256
+```
+
+The binary targets Ubuntu 22.04 or newer and dynamically links Cyrus SASL. On Ubuntu or Debian, install its runtime dependencies with:
+
+```bash
+sudo apt-get install libsasl2-2 libsasl2-modules zlib1g
+```
+
+GSSAPI/Kerberos users also need their distro's Cyrus SASL GSSAPI module, such as `libsasl2-modules-gssapi-mit` on Ubuntu.
+
+Use Nix when you want Fransson and all runtime dependencies managed together.
+
 ## Dump production data and restore it locally
 
 Create `fransson.yaml` with the source credentials, local destination, and restore target:
@@ -283,3 +302,5 @@ nix develop
 cargo test
 nix flake check
 ```
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for commit conventions and the release process. Releases are generated through release-plz; do not manually bump the Cargo version or changelog.

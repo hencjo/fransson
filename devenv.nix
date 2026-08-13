@@ -26,7 +26,6 @@
   languages.rust = {
     enable = true;
     channel = "stable";
-    targets = [ "x86_64-unknown-linux-musl" ];
     components = [
       "rustc"
       "cargo"
