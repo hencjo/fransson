@@ -1,5 +1,3 @@
-state_file: .state/fransson.json
-
 sources:
   primary:
     bootstrap_servers: localhost:9092

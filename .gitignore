@@ -12,6 +12,7 @@ devenv.local.yaml
 # Rust
 /target
 .state/
+.fransson/
 
 # Devenv
 .devenv*

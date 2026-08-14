@@ -8,6 +8,7 @@ Enter the development shell and run the checks before submitting changes:
 nix develop
 cargo fmt -- --check
 cargo test
+cargo clippy --all-targets -- -D warnings
 nix flake check
 nix eval --raw .#packages.x86_64-linux.fransson.version
 git diff --check
@@ -15,14 +16,14 @@ git diff --check
 
 The Nix version must match `Cargo.toml`.
 
-The ignored reconciliation tests require a disposable Kafka 4.2.0 broker and delete the uniquely named topics they create:
+The ignored reconciliation tests require a disposable Kafka 4.2.0 broker, exercise topic UUID fencing, and delete the uniquely named topics they create:
 
 ```bash
 FRANSSON_TEST_KAFKA_BOOTSTRAP_SERVERS=localhost:9092 \
   cargo test kafka_reconciliation_ -- --ignored --nocapture
 ```
 
-Keep `README.md`, this guide, and the files under `examples/` accurate when changing public behavior.
+Keep `README.md`, `UPGRADING.md`, this guide, and the files under `examples/` accurate when changing public behavior.
 
 ## Commits and versions
 

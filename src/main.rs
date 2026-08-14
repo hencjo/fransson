@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fmt;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
+use fs2::FileExt;
 use futures_util::stream::{FuturesOrdered, StreamExt};
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, ResourceSpecifier, TopicReplication};
 use rdkafka::client::DefaultClientContext;
@@ -20,7 +21,7 @@ use rdkafka::consumer::{
 use rdkafka::error::RDKafkaErrorCode;
 use rdkafka::message::{Header, Headers, Message, OwnedHeaders, OwnedMessage};
 use rdkafka::metadata::{Metadata, MetadataTopic};
-use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
 use rdkafka::util::Timeout;
 use serde::{Deserialize, Serialize};
@@ -28,6 +29,7 @@ use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 
 mod archive;
+mod kafka_identity;
 
 use archive::{ArchiveEvent, ArchiveHeader, ArchiveReader, ArchiveRecord, ArchiveWriter};
 
@@ -54,6 +56,8 @@ enum Command {
     Restore(ConfigArgs),
     /// Reconcile topics, continuously clone, and stream new events
     Run(ConfigArgs),
+    /// Inspect or reset Fransson's local state registry
+    State(StateArgs),
 }
 
 #[derive(Debug, Args)]
@@ -61,9 +65,50 @@ struct ConfigArgs {
     /// YAML configuration file
     #[arg(short, long, value_name = "FILE")]
     config: PathBuf,
+    /// Persistent state directory
+    #[arg(long, value_name = "DIR", default_value = ".fransson")]
+    state_dir: PathBuf,
     /// Authorize every required destination topic recreation
     #[arg(long)]
     force: bool,
+}
+
+#[derive(Debug, Args)]
+struct StateArgs {
+    #[command(subcommand)]
+    command: StateCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum StateCommand {
+    /// Print the state registry as JSON
+    Show(StateShowArgs),
+    /// Remove state for configured destination topics
+    Reset(StateResetArgs),
+}
+
+#[derive(Debug, Args)]
+struct StateShowArgs {
+    /// Persistent state directory
+    #[arg(long, value_name = "DIR", default_value = ".fransson")]
+    state_dir: PathBuf,
+}
+
+#[derive(Debug, Args)]
+#[command(group(clap::ArgGroup::new("selector").required(true).multiple(false).args(["topic", "all"])))]
+struct StateResetArgs {
+    /// YAML configuration file
+    #[arg(short, long, value_name = "FILE")]
+    config: PathBuf,
+    /// Persistent state directory
+    #[arg(long, value_name = "DIR", default_value = ".fransson")]
+    state_dir: PathBuf,
+    /// Reset one configured destination topic
+    #[arg(long, value_name = "TOPIC")]
+    topic: Option<String>,
+    /// Reset every destination topic declared by the configuration
+    #[arg(long)]
+    all: bool,
 }
 
 #[derive(Debug, Args)]
@@ -85,8 +130,6 @@ struct DumpArgs {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AppConfig {
-    #[serde(default)]
-    state_file: Option<PathBuf>,
     #[serde(default)]
     sources: HashMap<String, SourceKafkaConfig>,
     #[serde(default)]
@@ -237,21 +280,50 @@ struct RestorePlan {
     archive: PathBuf,
 }
 
-const STATE_FORMAT_VERSION: u16 = 1;
+const STATE_FORMAT_VERSION: u16 = 2;
+const STATE_FILE_NAME: &str = "state.json";
+const STATE_LOCK_NAME: &str = "state.lock";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct OffsetState {
+struct StateRegistry {
     format_version: u16,
-    clones: HashMap<String, CloneState>,
-    restores: HashMap<String, RestoreMarker>,
+    clusters: BTreeMap<String, ClusterState>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClusterState {
+    topics: BTreeMap<String, TopicState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TopicState {
+    topic_id: String,
+    state: TopicModeState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+enum TopicModeState {
+    Clone(CloneState),
+    Restore(RestoreMarker),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CloneState {
-    source: String,
-    next_offsets: HashMap<i32, i64>,
+    source: SourceIdentity,
+    next_offsets: BTreeMap<String, i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceIdentity {
+    cluster_id: String,
+    topic: String,
+    topic_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -259,19 +331,31 @@ struct CloneState {
 struct RestoreMarker {
     archive_sha256: String,
     archive_format_version: u16,
+    status: RestoreStatus,
 }
 
-impl Default for OffsetState {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RestoreStatus {
+    InProgress,
+    Complete,
+}
+
+#[derive(Debug, Clone, Default)]
+struct OffsetState {
+    topics: BTreeMap<String, TopicState>,
+}
+
+impl Default for StateRegistry {
     fn default() -> Self {
         Self {
             format_version: STATE_FORMAT_VERSION,
-            clones: HashMap::new(),
-            restores: HashMap::new(),
+            clusters: BTreeMap::new(),
         }
     }
 }
 
-impl OffsetState {
+impl StateRegistry {
     fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
@@ -291,54 +375,6 @@ impl OffsetState {
         Ok(state)
     }
 
-    fn next_offset(&self, destination_topic: &str, partition: i32) -> Option<i64> {
-        self.clones
-            .get(destination_topic)?
-            .next_offsets
-            .get(&partition)
-            .copied()
-    }
-
-    fn update_next_offset(
-        &mut self,
-        destination_topic: &str,
-        source: &SourceTopicRef,
-        partition: i32,
-        next_offset: i64,
-    ) {
-        self.clones
-            .entry(destination_topic.to_owned())
-            .or_insert_with(|| CloneState {
-                source: source.to_string(),
-                next_offsets: HashMap::new(),
-            })
-            .next_offsets
-            .insert(partition, next_offset);
-    }
-
-    fn clear_topic(&mut self, destination_topic: &str) -> bool {
-        let removed_offsets = self.clones.remove(destination_topic).is_some();
-        let removed_restore = self.restores.remove(destination_topic).is_some();
-        removed_offsets || removed_restore
-    }
-
-    fn restore_matches(&self, destination_topic: &str, fingerprint: &str) -> bool {
-        self.restores.get(destination_topic).is_some_and(|marker| {
-            marker.archive_sha256 == fingerprint
-                && marker.archive_format_version == archive::format_version()
-        })
-    }
-
-    fn mark_restored(&mut self, destination_topic: &str, fingerprint: String) {
-        self.restores.insert(
-            destination_topic.to_owned(),
-            RestoreMarker {
-                archive_sha256: fingerprint,
-                archive_format_version: archive::format_version(),
-            },
-        );
-    }
-
     fn persist(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).with_context(|| {
@@ -348,12 +384,24 @@ impl OffsetState {
 
         let tmp_path = path.with_extension("tmp");
         let bytes = serde_json::to_vec_pretty(self).context("failed to serialize offset state")?;
-        fs::write(&tmp_path, bytes).with_context(|| {
+        let mut tmp = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp_path)
+            .with_context(|| {
+                format!("failed to open temporary state file {}", tmp_path.display())
+            })?;
+        tmp.write_all(&bytes).with_context(|| {
             format!(
                 "failed to write temporary state file {}",
                 tmp_path.display()
             )
         })?;
+        tmp.sync_all().with_context(|| {
+            format!("failed to sync temporary state file {}", tmp_path.display())
+        })?;
+        drop(tmp);
         fs::rename(&tmp_path, path).with_context(|| {
             format!(
                 "failed to move temporary state file {} into place at {}",
@@ -361,18 +409,192 @@ impl OffsetState {
                 path.display()
             )
         })?;
+        if let Some(parent) = path.parent() {
+            File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .with_context(|| format!("failed to sync state directory {}", parent.display()))?;
+        }
         Ok(())
     }
 }
 
+impl OffsetState {
+    fn next_offset(&self, destination_topic: &str, partition: i32) -> Option<i64> {
+        let TopicModeState::Clone(clone) = &self.topics.get(destination_topic)?.state else {
+            return None;
+        };
+        clone.next_offsets.get(&partition.to_string()).copied()
+    }
+
+    fn update_next_offset(
+        &mut self,
+        destination_topic: &str,
+        topic_id: &str,
+        source: &SourceIdentity,
+        partition: i32,
+        next_offset: i64,
+    ) {
+        let entry = self
+            .topics
+            .entry(destination_topic.to_owned())
+            .or_insert_with(|| TopicState {
+                topic_id: topic_id.to_owned(),
+                state: TopicModeState::Clone(CloneState {
+                    source: source.clone(),
+                    next_offsets: BTreeMap::new(),
+                }),
+            });
+        if let TopicModeState::Clone(clone) = &mut entry.state {
+            clone
+                .next_offsets
+                .insert(partition.to_string(), next_offset);
+        }
+    }
+
+    fn clear_topic(&mut self, destination_topic: &str) -> bool {
+        self.topics.remove(destination_topic).is_some()
+    }
+
+    fn restore_matches(&self, destination_topic: &str, topic_id: &str, fingerprint: &str) -> bool {
+        self.topics.get(destination_topic).is_some_and(|state| {
+            state.topic_id == topic_id
+                && matches!(&state.state, TopicModeState::Restore(marker)
+                    if marker.archive_sha256 == fingerprint
+                    && marker.archive_format_version == archive::format_version()
+                    && marker.status == RestoreStatus::Complete)
+        })
+    }
+
+    fn mark_restore(
+        &mut self,
+        destination_topic: &str,
+        topic_id: String,
+        fingerprint: String,
+        status: RestoreStatus,
+    ) {
+        self.topics.insert(
+            destination_topic.to_owned(),
+            TopicState {
+                topic_id,
+                state: TopicModeState::Restore(RestoreMarker {
+                    archive_sha256: fingerprint,
+                    archive_format_version: archive::format_version(),
+                    status,
+                }),
+            },
+        );
+    }
+}
+
+struct StateStore {
+    file: PathBuf,
+    lock: PathBuf,
+    cluster_id: String,
+    managed_topics: Vec<String>,
+    _topic_locks: Vec<File>,
+}
+
+impl StateStore {
+    fn open(
+        directory: PathBuf,
+        cluster_id: String,
+        topics: &[ManagedTopic],
+    ) -> Result<(Self, OffsetState)> {
+        fs::create_dir_all(&directory)
+            .with_context(|| format!("failed to create state directory {}", directory.display()))?;
+        let file = directory.join(STATE_FILE_NAME);
+        let lock = directory.join(STATE_LOCK_NAME);
+        let mut names: Vec<String> = topics.iter().map(|topic| topic.name.clone()).collect();
+        names.sort();
+        let lock_dir = directory.join("locks");
+        fs::create_dir_all(&lock_dir)?;
+        let mut topic_locks = Vec::new();
+        for name in &names {
+            let digest = sha256_text(&format!("{cluster_id}\0{name}"));
+            let path = lock_dir.join(format!("{digest}.lock"));
+            let handle = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&path)?;
+            handle.try_lock_exclusive().with_context(|| {
+                format!(
+                    "destination topic {name} is already managed by another local Fransson process"
+                )
+            })?;
+            topic_locks.push(handle);
+        }
+        let registry = with_registry_lock(&lock, || StateRegistry::load(&file))?;
+        let state = OffsetState {
+            topics: registry
+                .clusters
+                .get(&cluster_id)
+                .map(|cluster| cluster.topics.clone())
+                .unwrap_or_default(),
+        };
+        Ok((
+            Self {
+                file,
+                lock,
+                cluster_id,
+                managed_topics: names,
+                _topic_locks: topic_locks,
+            },
+            state,
+        ))
+    }
+
+    fn persist(&self, snapshot: &OffsetState) -> Result<()> {
+        with_registry_lock(&self.lock, || {
+            let mut registry = StateRegistry::load(&self.file)?;
+            let cluster = registry
+                .clusters
+                .entry(self.cluster_id.clone())
+                .or_default();
+            for topic in &self.managed_topics {
+                if let Some(state) = snapshot.topics.get(topic) {
+                    cluster.topics.insert(topic.clone(), state.clone());
+                } else {
+                    cluster.topics.remove(topic);
+                }
+            }
+            if cluster.topics.is_empty() {
+                registry.clusters.remove(&self.cluster_id);
+            }
+            registry.persist(&self.file)
+        })
+    }
+}
+
+fn with_registry_lock<T>(lock_path: &Path, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)?;
+    lock.lock_exclusive()?;
+    let result = operation();
+    FileExt::unlock(&lock)?;
+    result
+}
+
+fn sha256_text(value: &str) -> String {
+    use sha2::Digest;
+    format!("{:x}", sha2::Sha256::digest(value.as_bytes()))
+}
+
 #[derive(Clone)]
 struct RuntimeContext {
-    state_file: Arc<PathBuf>,
+    state_store: Arc<StateStore>,
     state: Arc<Mutex<OffsetState>>,
     state_dirty: Arc<AtomicBool>,
     producer: FutureProducer,
     stream_producer: Option<FutureProducer>,
     status: Arc<Mutex<StatusBoard>>,
+    destination_topic_ids: Arc<Mutex<HashMap<String, String>>>,
+    source_identities: Arc<HashMap<String, SourceIdentity>>,
 }
 
 #[derive(Debug, Clone)]
@@ -403,20 +625,84 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Dump(args) => dump_topic(args).await,
         Command::Restore(args) => {
-            execute_config(args.config, ExecutionMode::Restore, args.force).await
+            execute_config(
+                args.config,
+                args.state_dir,
+                ExecutionMode::Restore,
+                args.force,
+            )
+            .await
         }
-        Command::Run(args) => execute_config(args.config, ExecutionMode::Run, args.force).await,
+        Command::Run(args) => {
+            execute_config(args.config, args.state_dir, ExecutionMode::Run, args.force).await
+        }
+        Command::State(args) => execute_state_command(args).await,
     }
 }
 
-async fn execute_config(config_path: PathBuf, mode: ExecutionMode, force: bool) -> Result<()> {
+async fn execute_state_command(args: StateArgs) -> Result<()> {
+    match args.command {
+        StateCommand::Show(args) => {
+            let directory = absolute_path(&args.state_dir)?;
+            let file = directory.join(STATE_FILE_NAME);
+            let registry = if directory.exists() {
+                with_registry_lock(&directory.join(STATE_LOCK_NAME), || {
+                    StateRegistry::load(&file)
+                })?
+            } else {
+                StateRegistry::default()
+            };
+            println!("{}", serde_json::to_string_pretty(&registry)?);
+            Ok(())
+        }
+        StateCommand::Reset(args) => reset_state(args).await,
+    }
+}
+
+async fn reset_state(args: StateResetArgs) -> Result<()> {
+    let config = load_config(&args.config)?;
+    validate_config(&config)?;
+    let destination = config
+        .destination
+        .as_ref()
+        .context("destination is required by state reset")?;
+    let topics = resolve_topics(&config, &args.config)?;
+    if topics.is_empty() {
+        bail!("topics must contain at least one destination for state reset");
+    }
+    let selected: Vec<String> = if args.all {
+        topics.iter().map(|topic| topic.name.clone()).collect()
+    } else {
+        let topic = args.topic.context("--topic or --all is required")?;
+        if !topics.iter().any(|configured| configured.name == topic) {
+            bail!("destination topic {topic} is not declared by the configuration");
+        }
+        vec![topic]
+    };
+    let consumer = build_consumer_for_destination_metadata(destination)?;
+    consumer
+        .fetch_metadata(None, Duration::from_secs(10))
+        .context("failed to connect to destination Kafka cluster")?;
+    let cluster_id = kafka_identity::cluster_id(consumer.client())
+        .context("failed to identify destination Kafka cluster")?;
+    let directory = absolute_path(&args.state_dir)?;
+    let (store, mut state) = StateStore::open(directory, cluster_id, &topics)?;
+    for topic in &selected {
+        state.clear_topic(topic);
+    }
+    store.persist(&state)?;
+    println!("reset state for {}", selected.join(", "));
+    Ok(())
+}
+
+async fn execute_config(
+    config_path: PathBuf,
+    state_dir: PathBuf,
+    mode: ExecutionMode,
+    force: bool,
+) -> Result<()> {
     let config = load_config(&config_path)?;
     validate_config(&config)?;
-    let state_file = config
-        .state_file
-        .as_ref()
-        .context("state_file is required by restore and run")?;
-    let state_file = resolve_config_path(&config_path, state_file);
     let destination = config
         .destination
         .as_ref()
@@ -430,12 +716,15 @@ async fn execute_config(config_path: PathBuf, mode: ExecutionMode, force: bool) 
         bail!("run requires at least one clone or stream topic");
     }
     let clone_topics = collect_clone_topics_by_source(&topics);
+    let source_identities = fetch_source_identities(&config.sources, &clone_topics)?;
     let clone_end_offsets = if mode == ExecutionMode::Restore {
         fetch_clone_end_offsets(&config.sources, &clone_topics)?
     } else {
         HashMap::new()
     };
     let producer = build_producer(destination)?;
+    let destination_cluster_id = kafka_identity::cluster_id(producer.client())
+        .context("failed to identify destination Kafka cluster")?;
     let stream_producer = if mode == ExecutionMode::Run
         && topics.iter().any(|topic| {
             topic
@@ -448,14 +737,22 @@ async fn execute_config(config_path: PathBuf, mode: ExecutionMode, force: bool) 
         None
     };
 
-    let state = OffsetState::load(&state_file)?;
+    let resolved_state_dir = absolute_path(&state_dir)?;
+    eprintln!(
+        "state: {}",
+        resolved_state_dir.join(STATE_FILE_NAME).display()
+    );
+    let (state_store, state) =
+        StateStore::open(resolved_state_dir, destination_cluster_id, &topics)?;
     let runtime = RuntimeContext {
-        state_file: Arc::new(state_file.clone()),
+        state_store: Arc::new(state_store),
         state: Arc::new(Mutex::new(state)),
         state_dirty: Arc::new(AtomicBool::new(false)),
         producer,
         stream_producer,
         status: Arc::new(Mutex::new(StatusBoard::default())),
+        destination_topic_ids: Arc::new(Mutex::new(HashMap::new())),
+        source_identities: Arc::new(source_identities),
     };
 
     reconcile_destination_topics(
@@ -467,10 +764,10 @@ async fn execute_config(config_path: PathBuf, mode: ExecutionMode, force: bool) 
         force,
     )
     .await?;
-    clear_stream_state(&topics, &runtime).await?;
+    clear_non_stateful_topic_state(&topics, &runtime).await?;
     {
         let state = runtime.state.lock().await;
-        validate_state_sources(&state, &topics)?;
+        validate_state_sources(&state, &topics, &runtime.source_identities)?;
     }
 
     let mut workers = JoinSet::new();
@@ -725,6 +1022,17 @@ async fn finish_partition_inflight(
         handle_delivery_result(plan, result, runtime).await?;
     }
     if let Some(end_offset) = end_offset {
+        let topic_id = runtime
+            .destination_topic_ids
+            .lock()
+            .await
+            .get(&plan.destination_topic)
+            .cloned()
+            .context("missing destination topic identity")?;
+        let source = runtime
+            .source_identities
+            .get(&plan.source.to_string())
+            .context("missing source topic identity")?;
         let mut state = runtime.state.lock().await;
         let current = state
             .next_offset(&plan.destination_topic, partition_id)
@@ -732,7 +1040,8 @@ async fn finish_partition_inflight(
         if current < end_offset {
             state.update_next_offset(
                 &plan.destination_topic,
-                &plan.source,
+                &topic_id,
+                source,
                 partition_id,
                 end_offset,
             );
@@ -858,10 +1167,22 @@ async fn handle_delivery_result(
     match result.produce_result {
         Ok(()) => {
             if plan.kind == TransferKind::Clone {
+                let topic_id = runtime
+                    .destination_topic_ids
+                    .lock()
+                    .await
+                    .get(&result.destination_topic)
+                    .cloned()
+                    .context("missing destination topic identity")?;
+                let source = runtime
+                    .source_identities
+                    .get(&plan.source.to_string())
+                    .context("missing source topic identity")?;
                 let mut state = runtime.state.lock().await;
                 state.update_next_offset(
                     &result.destination_topic,
-                    &plan.source,
+                    &topic_id,
+                    source,
                     result.partition,
                     result.next_offset,
                 );
@@ -934,7 +1255,7 @@ async fn flush_state(runtime: &RuntimeContext, force: bool) -> Result<()> {
         state.clone()
     };
 
-    if let Err(err) = snapshot.persist(runtime.state_file.as_ref()) {
+    if let Err(err) = runtime.state_store.persist(&snapshot) {
         runtime.state_dirty.store(true, Ordering::Release);
         return Err(err);
     }
@@ -958,6 +1279,16 @@ fn resolve_config_path(config_path: &Path, value: &Path) -> PathBuf {
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .join(value)
+    }
+}
+
+fn absolute_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_owned())
+    } else {
+        Ok(env::current_dir()
+            .context("failed to resolve current directory")?
+            .join(path))
     }
 }
 
@@ -992,14 +1323,6 @@ fn validate_config(config: &AppConfig) -> Result<()> {
         "delivery.timeout.ms",
         "max.in.flight.requests.per.connection",
     ];
-
-    if config
-        .state_file
-        .as_ref()
-        .is_some_and(|path| path.as_os_str().is_empty())
-    {
-        bail!("state_file must not be empty");
-    }
 
     for (name, source) in &config.sources {
         require_nonblank(name, "source name")?;
@@ -1395,7 +1718,11 @@ fn collect_transfer_topics_by_source(
     collect_topics_by_source(topics, None)
 }
 
-fn validate_state_sources(state: &OffsetState, topics: &[ManagedTopic]) -> Result<()> {
+fn validate_state_sources(
+    state: &OffsetState,
+    topics: &[ManagedTopic],
+    identities: &HashMap<String, SourceIdentity>,
+) -> Result<()> {
     for topic in topics {
         let Some(transfer) = topic
             .transfer
@@ -1404,14 +1731,24 @@ fn validate_state_sources(state: &OffsetState, topics: &[ManagedTopic]) -> Resul
         else {
             continue;
         };
-        if let Some(clone_state) = state.clones.get(&topic.name) {
-            let configured_source = transfer.source.to_string();
-            if clone_state.source != configured_source {
+        if let Some(TopicState {
+            state: TopicModeState::Clone(clone_state),
+            ..
+        }) = state.topics.get(&topic.name)
+        {
+            let configured_source = identities
+                .get(&transfer.source.to_string())
+                .context("missing configured source identity")?;
+            if &clone_state.source != configured_source {
                 bail!(
-                    "state for destination topic {} belongs to source {} but config uses {}",
+                    "state for destination topic {} belongs to source cluster/topic {}/{} ({}) but config uses {}/{} ({})",
                     topic.name,
-                    clone_state.source,
-                    configured_source
+                    clone_state.source.cluster_id,
+                    clone_state.source.topic,
+                    clone_state.source.topic_id,
+                    configured_source.cluster_id,
+                    configured_source.topic,
+                    configured_source.topic_id,
                 );
             }
         }
@@ -1419,8 +1756,61 @@ fn validate_state_sources(state: &OffsetState, topics: &[ManagedTopic]) -> Resul
     Ok(())
 }
 
+fn clone_state_mismatch_reason(
+    saved: Option<&TopicState>,
+    destination_topic_id: &str,
+    source: &SourceIdentity,
+) -> Option<String> {
+    match saved {
+        None => Some("existing clone topic has no trusted state".to_owned()),
+        Some(saved) if saved.topic_id != destination_topic_id => Some(format!(
+            "saved destination topic UUID is {} but broker reports {}",
+            saved.topic_id, destination_topic_id
+        )),
+        Some(TopicState {
+            state: TopicModeState::Clone(clone),
+            ..
+        }) if &clone.source != source => {
+            Some("saved clone source identity differs from the configured source".to_owned())
+        }
+        Some(TopicState {
+            state: TopicModeState::Clone(_),
+            ..
+        }) => None,
+        Some(_) => Some("saved state belongs to a different data mode".to_owned()),
+    }
+}
+
 fn collect_clone_topics_by_source(topics: &[ManagedTopic]) -> HashMap<String, Vec<TransferPlan>> {
     collect_topics_by_source(topics, Some(TransferKind::Clone))
+}
+
+fn fetch_source_identities(
+    sources: &HashMap<String, SourceKafkaConfig>,
+    grouped: &HashMap<String, Vec<TransferPlan>>,
+) -> Result<HashMap<String, SourceIdentity>> {
+    let mut identities = HashMap::new();
+    for (source_name, plans) in grouped {
+        let config = sources
+            .get(source_name)
+            .ok_or_else(|| anyhow!("missing source configuration for {source_name}"))?;
+        let consumer = build_source_consumer(config, true)?;
+        let cluster_id = kafka_identity::cluster_id(consumer.client())
+            .with_context(|| format!("failed to identify source Kafka cluster {source_name}"))?;
+        for plan in plans {
+            let topic_id = kafka_identity::topic_id(consumer.client(), &plan.source.topic)
+                .with_context(|| format!("failed to identify source topic {}", plan.source))?;
+            identities.insert(
+                plan.source.to_string(),
+                SourceIdentity {
+                    cluster_id: cluster_id.clone(),
+                    topic: plan.source.topic.clone(),
+                    topic_id,
+                },
+            );
+        }
+    }
+    Ok(identities)
 }
 
 fn collect_topics_by_source(
@@ -1761,6 +2151,18 @@ async fn reconcile_destination_topics(
                 error
             );
         }
+        let existing_topic_id = if existing.is_some() {
+            let topic_id = kafka_identity::topic_id(metadata_consumer.client(), &topic.name)
+                .with_context(|| format!("failed to identify destination topic {}", topic.name))?;
+            runtime
+                .destination_topic_ids
+                .lock()
+                .await
+                .insert(topic.name.clone(), topic_id.clone());
+            Some(topic_id)
+        } else {
+            None
+        };
         let mismatch_reason = if topic
             .static_topic
             .as_ref()
@@ -1780,11 +2182,13 @@ async fn reconcile_destination_topics(
         } else {
             None
         };
-        let restore_complete = if let Some(fingerprint) = restore_fingerprint.as_deref() {
+        let restore_complete = if let (Some(fingerprint), Some(topic_id)) =
+            (restore_fingerprint.as_deref(), existing_topic_id.as_deref())
+        {
             let state = runtime.state.lock().await;
-            state.restore_matches(&topic.name, fingerprint)
+            state.restore_matches(&topic.name, topic_id, fingerprint)
         } else {
-            true
+            topic.restore.is_none()
         };
         let needs_restore = topic.restore.is_some() && !restore_complete;
         let clone_state_mismatch = if let Some(transfer) = topic
@@ -1792,16 +2196,20 @@ async fn reconcile_destination_topics(
             .as_ref()
             .filter(|transfer| transfer.kind == TransferKind::Clone)
         {
-            let state = runtime.state.lock().await;
-            state.clones.get(&topic.name).and_then(|clone_state| {
-                let configured_source = transfer.source.to_string();
-                (clone_state.source != configured_source).then(|| {
-                    format!(
-                        "saved clone source is {} but config uses {}",
-                        clone_state.source, configured_source
-                    )
-                })
-            })
+            if let Some(topic_id) = existing_topic_id.as_deref() {
+                let state = runtime.state.lock().await;
+                let configured_source = runtime
+                    .source_identities
+                    .get(&transfer.source.to_string())
+                    .context("missing configured source identity")?;
+                clone_state_mismatch_reason(
+                    state.topics.get(&topic.name),
+                    topic_id,
+                    configured_source,
+                )
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -1870,11 +2278,61 @@ async fn reconcile_destination_topics(
         )
         .await?;
 
+        let topic_id = kafka_identity::topic_id(metadata_consumer.client(), &topic.name)
+            .with_context(|| {
+                format!(
+                    "failed to identify created destination topic {}",
+                    topic.name
+                )
+            })?;
+        runtime
+            .destination_topic_ids
+            .lock()
+            .await
+            .insert(topic.name.clone(), topic_id.clone());
+
+        if let Some(transfer) = topic
+            .transfer
+            .as_ref()
+            .filter(|transfer| transfer.kind == TransferKind::Clone)
+        {
+            let source = runtime
+                .source_identities
+                .get(&transfer.source.to_string())
+                .context("missing configured source identity")?;
+            {
+                let mut state = runtime.state.lock().await;
+                state.topics.insert(
+                    topic.name.clone(),
+                    TopicState {
+                        topic_id: topic_id.clone(),
+                        state: TopicModeState::Clone(CloneState {
+                            source: source.clone(),
+                            next_offsets: BTreeMap::new(),
+                        }),
+                    },
+                );
+            }
+            runtime.state_dirty.store(true, Ordering::Release);
+            flush_state(runtime, true).await?;
+        }
+
         if let (Some(restore), Some(fingerprint)) = (&topic.restore, plan.restore_fingerprint) {
+            {
+                let mut state = runtime.state.lock().await;
+                state.mark_restore(
+                    &topic.name,
+                    topic_id.clone(),
+                    fingerprint.clone(),
+                    RestoreStatus::InProgress,
+                );
+            }
+            runtime.state_dirty.store(true, Ordering::Release);
+            flush_state(runtime, true).await?;
             restore_archive(&restore.archive, &topic.name, &runtime.producer).await?;
             {
                 let mut state = runtime.state.lock().await;
-                state.mark_restored(&topic.name, fingerprint);
+                state.mark_restore(&topic.name, topic_id, fingerprint, RestoreStatus::Complete);
             }
             runtime.state_dirty.store(true, Ordering::Release);
             flush_state(runtime, true).await?;
@@ -1918,16 +2376,19 @@ async fn clear_topic_state(runtime: &RuntimeContext, topic: &str) -> Result<()> 
     flush_state(runtime, true).await
 }
 
-async fn clear_stream_state(topics: &[ManagedTopic], runtime: &RuntimeContext) -> Result<()> {
+async fn clear_non_stateful_topic_state(
+    topics: &[ManagedTopic],
+    runtime: &RuntimeContext,
+) -> Result<()> {
     let mut changed = false;
     {
         let mut state = runtime.state.lock().await;
         for topic in topics {
-            if topic
+            let is_clone = topic
                 .transfer
                 .as_ref()
-                .is_some_and(|transfer| transfer.kind == TransferKind::Stream)
-            {
+                .is_some_and(|transfer| transfer.kind == TransferKind::Clone);
+            if !is_clone && topic.restore.is_none() {
                 changed |= state.clear_topic(&topic.name);
             }
         }
@@ -2544,8 +3005,7 @@ mod tests {
 
     fn app_config_yaml(topic_fields: &str) -> String {
         format!(
-            r#"state_file: .state/test.json
-sources:
+            r#"sources:
   primary:
     bootstrap_servers: localhost:9092
     group_id: primary-test
@@ -2556,6 +3016,14 @@ topics:
 {topic_fields}
 "#
         )
+    }
+
+    fn test_source_identity() -> SourceIdentity {
+        SourceIdentity {
+            cluster_id: "source-cluster".to_owned(),
+            topic: "source".to_owned(),
+            topic_id: "source-topic-id".to_owned(),
+        }
     }
 
     fn mock_consumer(bootstrap_servers: &str, group: &str) -> StreamConsumer {
@@ -2691,7 +3159,13 @@ topics:
         };
         let metadata = fetch_metadata(consumer.as_ref(), std::slice::from_ref(&plan)).unwrap();
         let mut state = OffsetState::default();
-        state.update_next_offset("destination", &plan.source, 0, 0);
+        state.update_next_offset(
+            "destination",
+            "destination-topic-id",
+            &test_source_identity(),
+            0,
+            0,
+        );
         let assignment = build_assignment(
             &metadata,
             std::slice::from_ref(&plan),
@@ -2853,16 +3327,23 @@ topics:
     #[test]
     fn clearing_a_destination_removes_old_state() {
         let mut state = OffsetState::default();
-        let source = SourceTopicRef {
-            instance: "primary".to_owned(),
-            topic: "source".to_owned(),
-        };
-        state.update_next_offset("destination", &source, 0, 42);
-        state.mark_restored("destination", "fingerprint".to_owned());
+        state.update_next_offset(
+            "destination",
+            "destination-topic-id",
+            &test_source_identity(),
+            0,
+            42,
+        );
+        state.mark_restore(
+            "destination",
+            "destination-topic-id".to_owned(),
+            "fingerprint".to_owned(),
+            RestoreStatus::Complete,
+        );
 
         assert!(state.clear_topic("destination"));
         assert!(state.next_offset("destination", 0).is_none());
-        assert!(!state.restore_matches("destination", "fingerprint"));
+        assert!(!state.restore_matches("destination", "destination-topic-id", "fingerprint"));
     }
 
     #[test]
@@ -2911,15 +3392,36 @@ topics:
         ])
         .is_err());
 
-        let cli =
-            Cli::try_parse_from(["fransson", "restore", "--config", "config.yaml", "--force"])
-                .unwrap();
-        assert!(matches!(cli.command, Command::Restore(args) if args.force));
+        let cli = Cli::try_parse_from([
+            "fransson",
+            "restore",
+            "--config",
+            "config.yaml",
+            "--state-dir",
+            "/var/lib/fransson",
+            "--force",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command, Command::Restore(args)
+            if args.force && args.state_dir == Path::new("/var/lib/fransson")));
+
+        let cli = Cli::try_parse_from(["fransson", "state", "show"]).unwrap();
+        assert!(matches!(cli.command, Command::State(StateArgs {
+            command: StateCommand::Show(StateShowArgs { state_dir }),
+        }) if state_dir == Path::new(".fransson")));
+
+        assert!(
+            Cli::try_parse_from(["fransson", "state", "reset", "--config", "config.yaml"]).is_err()
+        );
     }
 
     #[test]
     fn yaml_rejects_removed_public_fields() {
         let removed = [
+            format!(
+                "state_file: .state/fransson.json\n{}",
+                app_config_yaml("    manage:\n      partitions: 1")
+            ),
             app_config_yaml("    max_message_bytes: 1048576\n    partitions: 1"),
             app_config_yaml("    restore:\n      file: dump.zst"),
             app_config_yaml("    options:\n      cleanup.policy: compact\n    partitions: 1"),
@@ -3006,16 +3508,180 @@ topics:
     #[test]
     fn state_schema_is_strict_and_binds_clone_source() {
         let mut state = OffsetState::default();
-        let source = SourceTopicRef {
-            instance: "primary".to_owned(),
-            topic: "source".to_owned(),
-        };
-        state.update_next_offset("destination", &source, 0, 42);
-        let json = serde_json::to_string(&state).unwrap();
-        let decoded: OffsetState = serde_json::from_str(&json).unwrap();
+        let mut registry = StateRegistry::default();
+        state.update_next_offset(
+            "destination",
+            "destination-topic-id",
+            &test_source_identity(),
+            0,
+            42,
+        );
+        registry.clusters.insert(
+            "destination-cluster".to_owned(),
+            ClusterState {
+                topics: state.topics.clone(),
+            },
+        );
+        let json = serde_json::to_string(&registry).unwrap();
+        let decoded: StateRegistry = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.format_version, STATE_FORMAT_VERSION);
-        assert_eq!(decoded.clones["destination"].source, "primary:source");
-        assert!(serde_json::from_str::<OffsetState>(r#"{"topics":{}}"#).is_err());
+        let TopicModeState::Clone(clone) =
+            &decoded.clusters["destination-cluster"].topics["destination"].state
+        else {
+            panic!("expected clone state")
+        };
+        assert_eq!(clone.source, test_source_identity());
+        assert!(!state.restore_matches("destination", "other-topic-id", "fingerprint"));
+        assert!(serde_json::from_str::<StateRegistry>(r#"{"clusters":{}}"#).is_err());
+    }
+
+    #[test]
+    fn clone_state_fails_closed_on_missing_or_mismatched_identity() {
+        let source = test_source_identity();
+        assert_eq!(
+            clone_state_mismatch_reason(None, "destination-id", &source).as_deref(),
+            Some("existing clone topic has no trusted state")
+        );
+        let saved = TopicState {
+            topic_id: "old-destination-id".to_owned(),
+            state: TopicModeState::Clone(CloneState {
+                source: source.clone(),
+                next_offsets: BTreeMap::new(),
+            }),
+        };
+        assert!(
+            clone_state_mismatch_reason(Some(&saved), "destination-id", &source)
+                .unwrap()
+                .contains("UUID")
+        );
+        let trusted = TopicState {
+            topic_id: "destination-id".to_owned(),
+            state: TopicModeState::Clone(CloneState {
+                source: source.clone(),
+                next_offsets: BTreeMap::new(),
+            }),
+        };
+        assert_eq!(
+            clone_state_mismatch_reason(Some(&trusted), "destination-id", &source),
+            None
+        );
+        let mut other_source = source.clone();
+        other_source.topic_id = "replacement-source-id".to_owned();
+        assert!(
+            clone_state_mismatch_reason(Some(&trusted), "destination-id", &other_source)
+                .unwrap()
+                .contains("source identity")
+        );
+    }
+
+    #[test]
+    fn restore_state_matches_only_completed_archive_and_topic_identity() {
+        let mut state = OffsetState::default();
+        state.mark_restore(
+            "destination",
+            "topic-id".to_owned(),
+            "archive-hash".to_owned(),
+            RestoreStatus::InProgress,
+        );
+        assert!(!state.restore_matches("destination", "topic-id", "archive-hash"));
+        state.mark_restore(
+            "destination",
+            "topic-id".to_owned(),
+            "archive-hash".to_owned(),
+            RestoreStatus::Complete,
+        );
+        assert!(state.restore_matches("destination", "topic-id", "archive-hash"));
+        assert!(!state.restore_matches("destination", "replacement-id", "archive-hash"));
+        assert!(!state.restore_matches("destination", "topic-id", "other-hash"));
+    }
+
+    #[test]
+    fn state_registry_persists_atomically() {
+        let directory = env::temp_dir().join(format!(
+            "fransson-state-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = directory.join(STATE_FILE_NAME);
+        let mut registry = StateRegistry::default();
+        registry.clusters.insert(
+            "cluster".to_owned(),
+            ClusterState {
+                topics: BTreeMap::from([(
+                    "destination".to_owned(),
+                    TopicState {
+                        topic_id: "topic-id".to_owned(),
+                        state: TopicModeState::Restore(RestoreMarker {
+                            archive_sha256: "hash".to_owned(),
+                            archive_format_version: archive::format_version(),
+                            status: RestoreStatus::InProgress,
+                        }),
+                    },
+                )]),
+            },
+        );
+        registry.persist(&path).unwrap();
+        let loaded = StateRegistry::load(&path).unwrap();
+        assert_eq!(
+            loaded.clusters["cluster"].topics["destination"].topic_id,
+            "topic-id"
+        );
+        assert!(!path.with_extension("tmp").exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn concurrent_state_stores_merge_disjoint_topics() {
+        let directory = env::temp_dir().join(format!(
+            "fransson-state-merge-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let topic = |name: &str| ManagedTopic {
+            name: name.to_owned(),
+            force: false,
+            replication_factor: None,
+            config: BTreeMap::new(),
+            static_topic: Some(StaticTopicPlan {
+                partitions: 1,
+                kind: StaticTopicKind::Manage,
+            }),
+            transfer: None,
+            restore: None,
+        };
+        let (store_a, mut state_a) =
+            StateStore::open(directory.clone(), "cluster".to_owned(), &[topic("a")]).unwrap();
+        let (store_b, mut state_b) =
+            StateStore::open(directory.clone(), "cluster".to_owned(), &[topic("b")]).unwrap();
+        let collision = StateStore::open(directory.clone(), "cluster".to_owned(), &[topic("a")])
+            .err()
+            .expect("same topic lock should fail");
+        assert!(collision.to_string().contains("already managed"));
+        state_a.mark_restore(
+            "a",
+            "a-id".to_owned(),
+            "a-hash".to_owned(),
+            RestoreStatus::Complete,
+        );
+        store_a.persist(&state_a).unwrap();
+        state_b.mark_restore(
+            "b",
+            "b-id".to_owned(),
+            "b-hash".to_owned(),
+            RestoreStatus::Complete,
+        );
+        store_b.persist(&state_b).unwrap();
+
+        let registry = StateRegistry::load(&directory.join(STATE_FILE_NAME)).unwrap();
+        assert_eq!(registry.clusters["cluster"].topics.len(), 2);
+        drop((store_a, store_b));
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -3130,6 +3796,9 @@ topics:
         .await
         .unwrap();
 
+        let mut previous_topic_id =
+            kafka_identity::topic_id(metadata.client(), &topic.name).unwrap();
+
         for _ in 0..25 {
             let deadline = Instant::now() + TOPIC_RECONCILIATION_TIMEOUT;
             delete_destination_topic(&admin, &metadata, &topic.name, deadline)
@@ -3141,6 +3810,9 @@ topics:
             wait_for_destination_topic_state(&metadata, &topic.name, Some(6), deadline)
                 .await
                 .unwrap();
+            let topic_id = kafka_identity::topic_id(metadata.client(), &topic.name).unwrap();
+            assert_ne!(topic_id, previous_topic_id);
+            previous_topic_id = topic_id;
 
             let live_metadata = metadata
                 .fetch_metadata(Some(&topic.name), Duration::from_secs(5))

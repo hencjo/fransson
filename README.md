@@ -63,8 +63,6 @@ Use Nix when you want Fransson and all runtime dependencies managed together.
 Create `fransson.yaml` with the source credentials, local destination, and restore target:
 
 ```yaml
-state_file: .state/fransson.json
-
 sources:
   production:
     bootstrap_servers: production-kafka.example.com:9093
@@ -108,8 +106,6 @@ The archive contains no source topic name, so its destination name comes from th
 Configure a stream mapping:
 
 ```yaml
-state_file: .state/fransson.json
-
 sources:
   production:
     bootstrap_servers: production-kafka.example.com:9093
@@ -166,7 +162,7 @@ in
 {
   packages = [ fransson ];
 
-  processes.fransson.exec = "fransson run --config ./fransson.yaml";
+  processes.fransson.exec = "fransson run --config ./fransson.yaml --state-dir ./.fransson";
 }
 ```
 
@@ -176,15 +172,13 @@ Start it with:
 devenv up
 ```
 
-Keep `fransson.yaml`, its state file, and archives in the project working directory. Do not interpolate the YAML path as a Nix path: that copies it into the read-only Nix store and breaks writable relative paths.
+Keep `fransson.yaml`, `.fransson/`, and archives on persistent writable storage. For services and containers, pass `--state-dir` explicitly and provision that directory. Do not interpolate YAML containing relative archive paths as a Nix path: that copies it into the read-only Nix store.
 
 ## Configuration reference
 
 All commands use the same strict YAML schema. Unknown fields, obsolete names, conflicting modes, and invalid combinations fail loudly. See [`config.example.yaml`](examples/config.example.yaml) for the complete authenticated example and [`config.no-auth-dst.example.yaml`](examples/config.no-auth-dst.example.yaml) for a destination without authentication.
 
 ```yaml
-state_file: .state/fransson.json
-
 sources:
   primary:
     bootstrap_servers: source:9093
@@ -252,7 +246,7 @@ topics:
 - `empty` creates a missing topic or recreates an existing one, guaranteeing a fresh empty topic immediately after reconciliation.
 - `replication_factor` is optional. Without it, new topics use the broker default and existing replication is not managed.
 - `config` owns the listed Kafka topic properties. Fransson also owns `message.timestamp.type=CreateTime` so copied timestamps survive.
-- Relative `state_file` and archive paths resolve from the YAML file's directory.
+- Relative archive paths resolve from the YAML file's directory.
 - A source topic can be mapped only once in a configuration.
 
 ## Reconciliation and force
@@ -269,9 +263,14 @@ Application writes after a completed restore do not count as drift and do not tr
 
 ## State, archives, and delivery
 
-- `state_file` is required by `restore` and `run`; `dump` can use a source-only configuration.
+Upgrading an older deployment? Follow [`UPGRADING.md`](UPGRADING.md); the old YAML field and state format are intentionally unsupported.
+
+- `restore` and `run` use `.fransson/state.json` in the current directory by default. `--state-dir DIR` selects persistent storage explicitly; `dump` never reads or writes state.
+- State is grouped by Kafka cluster ID and destination topic name, then fenced by immutable topic UUIDs. Clone state also records the source cluster and topic UUIDs. Fransson requires Kafka 2.8 or newer.
+- A missing or mismatched state entry for an existing clone or restore topic fails closed and requires `--force`; state from another cluster can never be applied silently.
+- `fransson state show` prints the registry. `fransson state reset --config FILE --topic TOPIC` resets one configured destination; `--all` resets every destination in that configuration. Resetting state never changes Kafka data.
 - Clone state records the next offset only after destination acknowledgement and is persisted atomically.
-- Restore state records the archive SHA-256 and format version only after every record is acknowledged.
+- Restore state records `in_progress` before copying and `complete` with the archive SHA-256 and format version only after every record is acknowledged.
 - Archives omit topic names and physical Kafka offsets, and are written atomically after all startup high-watermarks have been consumed.
 - Active streams use an idempotent producer and wait through retriable destination outages.
 - Fransson reads only its current state and archive formats; there are no compatibility aliases or migrations for pre-`0.1.0` files.
@@ -280,8 +279,10 @@ Application writes after a completed restore do not count as drift and do not tr
 
 ```text
 fransson dump --config FILE --source SOURCE:TOPIC --archive FILE [--force]
-fransson restore --config FILE [--force]
-fransson run --config FILE [--force]
+fransson restore --config FILE [--state-dir DIR] [--force]
+fransson run --config FILE [--state-dir DIR] [--force]
+fransson state show [--state-dir DIR]
+fransson state reset --config FILE (--topic TOPIC | --all) [--state-dir DIR]
 ```
 
 - `dump` creates one deterministic compressed archive and never connects to the destination.
