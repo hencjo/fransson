@@ -38,3 +38,6 @@ devenv.local.yaml
 
 # nix
 result
+
+# codex
+.codex
