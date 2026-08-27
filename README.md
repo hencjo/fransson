@@ -270,8 +270,8 @@ Clone checkpoints must remain between the source partition's current low and hig
 - State is grouped by Kafka cluster ID and destination topic name, then fenced by immutable topic UUIDs. Clone state also records the source cluster and topic UUIDs. Fransson requires Kafka 2.8 or newer.
 - A missing or mismatched state entry for an existing clone or restore topic fails closed and requires `--force`; state from another cluster can never be applied silently.
 - `fransson state show` prints the registry. `fransson state reset --config FILE --topic TOPIC` resets one configured destination; `--all` resets every destination in that configuration. Resetting state never changes Kafka data.
-- Clone state records the next offset only after destination acknowledgement and is persisted atomically.
-- Restore state records `applying` before copying and `applied` with the archive SHA-256 and format version only after every record is acknowledged. `applied` does not claim that later application writes, retention, or compaction left the topic equal to the archive.
+- Clone state records the next offset only after destination acknowledgement. Before each atomic persistence, Fransson revalidates the live source and destination cluster/topic identities and stops rather than checkpointing work against a replacement topic.
+- Restore state records `applying` before copying and `applied` with the archive SHA-256 and format version only after every record is acknowledged and the destination identity is revalidated. `applied` does not claim that later application writes, retention, or compaction left the topic equal to the archive.
 - Fransson fingerprints the exact archive bytes consumed. Replacing or modifying an archive during reconciliation fails the restore and leaves it `applying` rather than recording the wrong archive as applied.
 - Archives omit topic names and physical Kafka offsets, and are written atomically after all startup high-watermarks have been consumed.
 - Active streams use an idempotent producer and wait through retriable destination outages.

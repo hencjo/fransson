@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::time::Duration;
 
@@ -12,8 +13,23 @@ pub fn cluster_id<C: ClientContext>(client: &Client<C>) -> Result<String> {
 }
 
 pub fn topic_id<C: ClientContext>(client: &Client<C>, topic: &str) -> Result<String> {
-    let topic = CString::new(topic).context("topic name contains a NUL byte")?;
-    let mut topic_ptrs = [topic.as_ptr()];
+    topic_ids(client, &[topic])?
+        .remove(topic)
+        .with_context(|| format!("broker returned no identity for topic {topic}"))
+}
+
+pub fn topic_ids<C: ClientContext>(
+    client: &Client<C>,
+    topics: &[&str],
+) -> Result<HashMap<String, String>> {
+    if topics.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let topics: Vec<CString> = topics
+        .iter()
+        .map(|topic| CString::new(*topic).context("topic name contains a NUL byte"))
+        .collect::<Result<_>>()?;
+    let mut topic_ptrs: Vec<_> = topics.iter().map(|topic| topic.as_ptr()).collect();
 
     unsafe {
         let collection =
@@ -58,33 +74,43 @@ pub fn topic_id<C: ClientContext>(client: &Client<C>, topic: &str) -> Result<Str
                 bail!("broker returned no topic identity result");
             }
             let mut count = 0usize;
-            let topics = sys::rd_kafka_DescribeTopics_result_topics(described, &mut count);
-            if topics.is_null() || count != 1 {
-                bail!("broker returned {count} topic descriptions instead of one");
-            }
-            let description = *topics;
-            if description.is_null() {
-                bail!("broker returned an empty topic description");
-            }
-            let error = sys::rd_kafka_TopicDescription_error(description);
-            if !error.is_null() {
+            let descriptions = sys::rd_kafka_DescribeTopics_result_topics(described, &mut count);
+            if descriptions.is_null() || count != topic_ptrs.len() {
                 bail!(
-                    "failed to describe topic identity: {}",
-                    c_string(sys::rd_kafka_error_string(error))
+                    "broker returned {count} topic descriptions instead of {}",
+                    topic_ptrs.len()
                 );
             }
-            let uuid = sys::rd_kafka_TopicDescription_topic_id(description);
-            if uuid.is_null()
-                || (sys::rd_kafka_Uuid_most_significant_bits(uuid) == 0
-                    && sys::rd_kafka_Uuid_least_significant_bits(uuid) == 0)
-            {
-                bail!("broker returned no topic UUID; Fransson requires Kafka 2.8 or newer");
+            let mut identities = HashMap::with_capacity(count);
+            for index in 0..count {
+                let description = *descriptions.add(index);
+                if description.is_null() {
+                    bail!("broker returned an empty topic description");
+                }
+                let name = c_string(sys::rd_kafka_TopicDescription_name(description));
+                let error = sys::rd_kafka_TopicDescription_error(description);
+                if !error.is_null() {
+                    bail!(
+                        "failed to describe topic identity for {name}: {}",
+                        c_string(sys::rd_kafka_error_string(error))
+                    );
+                }
+                let uuid = sys::rd_kafka_TopicDescription_topic_id(description);
+                if uuid.is_null()
+                    || (sys::rd_kafka_Uuid_most_significant_bits(uuid) == 0
+                        && sys::rd_kafka_Uuid_least_significant_bits(uuid) == 0)
+                {
+                    bail!(
+                        "broker returned no topic UUID for {name}; Fransson requires Kafka 2.8 or newer"
+                    );
+                }
+                let encoded = c_string(sys::rd_kafka_Uuid_base64str(uuid));
+                if encoded.is_empty() {
+                    return Err(anyhow!("broker returned an empty topic UUID for {name}"));
+                }
+                identities.insert(name, encoded);
             }
-            let encoded = c_string(sys::rd_kafka_Uuid_base64str(uuid));
-            if encoded.is_empty() {
-                return Err(anyhow!("broker returned an empty topic UUID"));
-            }
-            Ok(encoded)
+            Ok(identities)
         })();
         sys::rd_kafka_event_destroy(event);
         result

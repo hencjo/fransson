@@ -326,6 +326,11 @@ struct SourceIdentity {
     topic_id: String,
 }
 
+struct SourceIdentityContext {
+    identities: HashMap<String, SourceIdentity>,
+    clients: HashMap<String, Arc<StreamConsumer>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RestoreMarker {
@@ -595,6 +600,8 @@ struct RuntimeContext {
     status: Arc<Mutex<StatusBoard>>,
     destination_topic_ids: Arc<Mutex<HashMap<String, String>>>,
     source_identities: Arc<HashMap<String, SourceIdentity>>,
+    source_identity_clients: Arc<HashMap<String, Arc<StreamConsumer>>>,
+    clone_sources: Arc<HashMap<String, SourceTopicRef>>,
 }
 
 #[derive(Debug, Clone)]
@@ -722,7 +729,7 @@ async fn execute_config(
         bail!("run requires at least one clone or stream topic");
     }
     let clone_topics = collect_clone_topics_by_source(&topics);
-    let source_identities = fetch_source_identities(&config.sources, &clone_topics)?;
+    let source_identity_context = fetch_source_identities(&config.sources, &clone_topics)?;
     let clone_boundaries = fetch_clone_boundaries(&config.sources, &clone_topics)?;
     let producer = build_producer(destination)?;
     let destination_cluster_id = kafka_identity::cluster_id(producer.client())
@@ -754,7 +761,20 @@ async fn execute_config(
         stream_producer,
         status: Arc::new(Mutex::new(StatusBoard::default())),
         destination_topic_ids: Arc::new(Mutex::new(HashMap::new())),
-        source_identities: Arc::new(source_identities),
+        source_identities: Arc::new(source_identity_context.identities),
+        source_identity_clients: Arc::new(source_identity_context.clients),
+        clone_sources: Arc::new(
+            topics
+                .iter()
+                .filter_map(|topic| {
+                    topic
+                        .transfer
+                        .as_ref()
+                        .filter(|transfer| transfer.kind == TransferKind::Clone)
+                        .map(|transfer| (topic.name.clone(), transfer.source.clone()))
+                })
+                .collect(),
+        ),
     };
 
     reconcile_destination_topics(
@@ -903,9 +923,9 @@ async fn execute_config(
                 }
             }
         };
+        abort_tasks(&mut workers).await;
+        abort_tasks(&mut background).await;
         let flush_result = flush_state(&runtime, true).await;
-        workers.abort_all();
-        background.abort_all();
         outcome?;
         flush_result?;
     } else {
@@ -936,9 +956,9 @@ async fn execute_config(
                 }
             }
         };
+        abort_tasks(&mut workers).await;
+        abort_tasks(&mut background).await;
         let flush_result = flush_state(&runtime, true).await;
-        workers.abort_all();
-        background.abort_all();
         outcome?;
         flush_result?;
     }
@@ -947,6 +967,11 @@ async fn execute_config(
     let _ = writeln!(stdout);
 
     Ok(())
+}
+
+async fn abort_tasks(tasks: &mut JoinSet<Result<()>>) {
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
 }
 
 async fn run_partition_loop(
@@ -1270,11 +1295,113 @@ async fn flush_state(runtime: &RuntimeContext, force: bool) -> Result<()> {
         state.clone()
     };
 
+    if let Err(error) = validate_progress_identities(runtime, &snapshot) {
+        runtime.state_dirty.store(true, Ordering::Release);
+        return Err(error);
+    }
+
     if let Err(err) = runtime.state_store.persist(&snapshot) {
         runtime.state_dirty.store(true, Ordering::Release);
         return Err(err);
     }
 
+    Ok(())
+}
+
+fn validate_progress_identities(runtime: &RuntimeContext, snapshot: &OffsetState) -> Result<()> {
+    let clone_topics: Vec<(&String, &TopicState, &SourceTopicRef)> = runtime
+        .clone_sources
+        .iter()
+        .filter_map(|(destination, source)| {
+            snapshot
+                .topics
+                .get(destination)
+                .map(|state| (destination, state, source))
+        })
+        .filter(|(_, state, _)| matches!(state.state, TopicModeState::Clone(_)))
+        .collect();
+    if clone_topics.is_empty() {
+        return Ok(());
+    }
+
+    let live_destination_cluster = kafka_identity::cluster_id(runtime.producer.client())
+        .context("failed to revalidate destination cluster identity")?;
+    ensure_identity(
+        "destination cluster",
+        &runtime.state_store.cluster_id,
+        &live_destination_cluster,
+    )?;
+    let destination_names: Vec<&str> = clone_topics
+        .iter()
+        .map(|(destination, _, _)| destination.as_str())
+        .collect();
+    let live_destinations =
+        kafka_identity::topic_ids(runtime.producer.client(), destination_names.as_slice())
+            .context("failed to revalidate destination topic identities")?;
+    for (destination, state, _) in &clone_topics {
+        let live = live_destinations
+            .get(destination.as_str())
+            .with_context(|| {
+                format!("missing live identity for destination topic {destination}")
+            })?;
+        ensure_identity(
+            &format!("destination topic {destination}"),
+            &state.topic_id,
+            live,
+        )?;
+    }
+
+    let mut by_source = HashMap::<&str, Vec<(&SourceTopicRef, &SourceIdentity)>>::new();
+    for (_, state, source) in clone_topics {
+        let TopicModeState::Clone(clone) = &state.state else {
+            unreachable!("clone topics were filtered above")
+        };
+        let configured = runtime
+            .source_identities
+            .get(&source.to_string())
+            .with_context(|| format!("missing configured source identity for {source}"))?;
+        if &clone.source != configured {
+            bail!("saved clone source identity for {source} changed before persistence");
+        }
+        by_source
+            .entry(source.instance.as_str())
+            .or_default()
+            .push((source, configured));
+    }
+    for (source_name, topics) in by_source {
+        let client = runtime
+            .source_identity_clients
+            .get(source_name)
+            .with_context(|| format!("missing identity client for source {source_name}"))?;
+        let live_cluster = kafka_identity::cluster_id(client.client())
+            .with_context(|| format!("failed to revalidate source cluster {source_name}"))?;
+        let expected_cluster = &topics[0].1.cluster_id;
+        ensure_identity(
+            &format!("source cluster {source_name}"),
+            expected_cluster,
+            &live_cluster,
+        )?;
+        let topic_names: Vec<&str> = topics
+            .iter()
+            .map(|(source, _)| source.topic.as_str())
+            .collect();
+        let live_topics = kafka_identity::topic_ids(client.client(), topic_names.as_slice())
+            .with_context(|| format!("failed to revalidate topics on source {source_name}"))?;
+        for (source, expected) in topics {
+            let live = live_topics
+                .get(&source.topic)
+                .with_context(|| format!("missing live identity for source topic {source}"))?;
+            ensure_identity(&format!("source topic {source}"), &expected.topic_id, live)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn ensure_identity(label: &str, expected: &str, actual: &str) -> Result<()> {
+    if expected != actual {
+        bail!("{label} identity changed from {expected} to {actual}");
+    }
     Ok(())
 }
 
@@ -1850,13 +1977,14 @@ fn collect_clone_topics_by_source(topics: &[ManagedTopic]) -> HashMap<String, Ve
 fn fetch_source_identities(
     sources: &HashMap<String, SourceKafkaConfig>,
     grouped: &HashMap<String, Vec<TransferPlan>>,
-) -> Result<HashMap<String, SourceIdentity>> {
+) -> Result<SourceIdentityContext> {
     let mut identities = HashMap::new();
+    let mut clients = HashMap::new();
     for (source_name, plans) in grouped {
         let config = sources
             .get(source_name)
             .ok_or_else(|| anyhow!("missing source configuration for {source_name}"))?;
-        let consumer = build_source_consumer(config, true)?;
+        let consumer = Arc::new(build_source_consumer(config, true)?);
         let cluster_id = kafka_identity::cluster_id(consumer.client())
             .with_context(|| format!("failed to identify source Kafka cluster {source_name}"))?;
         for plan in plans {
@@ -1871,8 +1999,12 @@ fn fetch_source_identities(
                 },
             );
         }
+        clients.insert(source_name.clone(), consumer);
     }
-    Ok(identities)
+    Ok(SourceIdentityContext {
+        identities,
+        clients,
+    })
 }
 
 fn collect_topics_by_source(
@@ -2410,6 +2542,7 @@ async fn reconcile_destination_topics(
                     topic.name
                 );
             }
+            validate_destination_identity(runtime, &topic.name, &topic_id)?;
             {
                 let mut state = runtime.state.lock().await;
                 state.mark_archive_application(
@@ -2425,6 +2558,27 @@ async fn reconcile_destination_topics(
     }
 
     Ok(())
+}
+
+fn validate_destination_identity(
+    runtime: &RuntimeContext,
+    topic: &str,
+    expected_topic_id: &str,
+) -> Result<()> {
+    let live_cluster = kafka_identity::cluster_id(runtime.producer.client())
+        .context("failed to revalidate destination cluster identity")?;
+    ensure_identity(
+        "destination cluster",
+        &runtime.state_store.cluster_id,
+        &live_cluster,
+    )?;
+    let live_topic = kafka_identity::topic_id(runtime.producer.client(), topic)
+        .with_context(|| format!("failed to revalidate destination topic {topic}"))?;
+    ensure_identity(
+        &format!("destination topic {topic}"),
+        expected_topic_id,
+        &live_topic,
+    )
 }
 
 struct ReconcilePlan {
@@ -3700,6 +3854,17 @@ topics:
             clone_checkpoint_mismatch_reason(Some(&saved), &transfer, &boundaries)
                 .unwrap()
                 .contains("below source low watermark")
+        );
+    }
+
+    #[test]
+    fn identity_fences_reject_replacement_clusters_and_topics() {
+        assert!(ensure_identity("destination topic", "expected", "expected").is_ok());
+        assert!(
+            ensure_identity("destination topic", "expected", "replacement")
+                .unwrap_err()
+                .to_string()
+                .contains("identity changed from expected to replacement")
         );
     }
 
