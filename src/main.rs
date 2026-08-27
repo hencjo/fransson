@@ -2401,7 +2401,15 @@ async fn reconcile_destination_topics(
             }
             runtime.state_dirty.store(true, Ordering::Release);
             flush_state(runtime, true).await?;
-            restore_archive(&restore.archive, &topic.name, &runtime.producer).await?;
+            let consumed_fingerprint =
+                restore_archive(&restore.archive, &topic.name, &runtime.producer).await?;
+            if consumed_fingerprint != fingerprint {
+                bail!(
+                    "restore archive {} changed after reconciliation; destination topic {} remains partially applied and must be recreated with force",
+                    restore.archive.display(),
+                    topic.name
+                );
+            }
             {
                 let mut state = runtime.state.lock().await;
                 state.mark_archive_application(
@@ -2654,7 +2662,7 @@ async fn wait_for_destination_topic_state(
     }
 }
 
-async fn restore_archive(path: &Path, topic: &str, producer: &FutureProducer) -> Result<()> {
+async fn restore_archive(path: &Path, topic: &str, producer: &FutureProducer) -> Result<String> {
     const MAX_IN_FLIGHT_PER_PARTITION: usize = 1024;
 
     let mut reader = ArchiveReader::open(path)?;
@@ -2691,7 +2699,7 @@ async fn restore_archive(path: &Path, topic: &str, producer: &FutureProducer) ->
     if partition.is_some() {
         bail!("archive ended inside a partition");
     }
-    Ok(())
+    reader.consumed_fingerprint()
 }
 
 async fn send_archive_record(

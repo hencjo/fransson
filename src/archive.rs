@@ -130,8 +130,34 @@ pub enum ArchiveEvent {
     PartitionEnd(i32),
 }
 
+struct HashingReader<R> {
+    inner: R,
+    hasher: Sha256,
+}
+
+impl<R> HashingReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            hasher: Sha256::new(),
+        }
+    }
+
+    fn fingerprint(&self) -> String {
+        hex_digest(self.hasher.clone().finalize())
+    }
+}
+
+impl<R: Read> Read for HashingReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        self.hasher.update(&buffer[..read]);
+        Ok(read)
+    }
+}
+
 pub struct ArchiveReader {
-    decoder: zstd::stream::read::Decoder<'static, BufReader<File>>,
+    decoder: zstd::stream::read::Decoder<'static, BufReader<HashingReader<File>>>,
     partitions: Vec<i32>,
     next_partition: usize,
     partition_open: bool,
@@ -140,8 +166,9 @@ pub struct ArchiveReader {
 
 impl ArchiveReader {
     pub fn open(path: &Path) -> Result<Self> {
-        let mut file = File::open(path)
+        let file = File::open(path)
             .with_context(|| format!("failed to open archive {}", path.display()))?;
+        let mut file = HashingReader::new(file);
         let mut magic = [0_u8; MAGIC.len()];
         file.read_exact(&mut magic)
             .with_context(|| format!("failed to read archive header from {}", path.display()))?;
@@ -208,6 +235,13 @@ impl ArchiveReader {
             marker => bail!("invalid archive record marker {marker}"),
         }
     }
+
+    pub fn consumed_fingerprint(&self) -> Result<String> {
+        if !self.finished {
+            bail!("archive fingerprint is unavailable before the archive is fully consumed");
+        }
+        Ok(self.decoder.get_ref().get_ref().fingerprint())
+    }
 }
 
 pub fn fingerprint(path: &Path) -> Result<String> {
@@ -216,8 +250,15 @@ pub fn fingerprint(path: &Path) -> Result<String> {
     );
     let mut hasher = Sha256::new();
     io::copy(&mut input, &mut hasher).context("failed to fingerprint archive")?;
-    let digest = hasher.finalize();
-    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+    Ok(hex_digest(hasher.finalize()))
+}
+
+fn hex_digest(digest: impl AsRef<[u8]>) -> String {
+    digest
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 pub fn format_version() -> u16 {
@@ -427,6 +468,7 @@ mod tests {
 
         let mut reader = ArchiveReader::open(&first).unwrap();
         assert_eq!(reader.partitions(), &[0, 1]);
+        assert!(reader.consumed_fingerprint().is_err());
         let mut decoded = vec![Vec::new(), Vec::new()];
         let mut partition = None;
         while let Some(event) = reader.next_event().unwrap() {
@@ -439,6 +481,10 @@ mod tests {
             }
         }
         assert_eq!(decoded, records());
+        assert_eq!(
+            reader.consumed_fingerprint().unwrap(),
+            fingerprint(&first).unwrap()
+        );
         assert_eq!(fingerprint(&first).unwrap(), fingerprint(&second).unwrap());
         let _ = fs::remove_file(first);
         let _ = fs::remove_file(second);
