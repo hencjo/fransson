@@ -277,6 +277,7 @@ Clone checkpoints must remain between the source partition's current low and hig
 - Restore state records `applying` before copying and `applied` with the archive SHA-256 and format version only after every record is acknowledged and the destination identity is revalidated. `applied` does not claim that later application writes, retention, or compaction left the topic equal to the archive.
 - Fransson fingerprints the exact archive bytes consumed. Replacing or modifying an archive during reconciliation fails the restore and leaves it `applying` rather than recording the wrong archive as applied.
 - Archives omit topic names and physical Kafka offsets, and are written atomically after all startup high-watermarks have been consumed.
+- A dump fails rather than jumping past a captured source offset that expires during collection.
 - Active streams use an idempotent producer and wait through retriable destination outages.
 - Fransson reads only its current state and archive formats; there are no compatibility aliases or migrations for pre-`0.1.0` files.
 

@@ -2224,7 +2224,8 @@ fn build_dump_consumer(config: &SourceKafkaConfig) -> Result<StreamConsumer> {
     client
         .set("enable.auto.commit", "false")
         .set("enable.auto.offset.store", "false")
-        .set("enable.partition.eof", "true");
+        .set("enable.partition.eof", "true")
+        .set("auto.offset.reset", "error");
     client
         .create()
         .context("failed to create Kafka dump consumer")
