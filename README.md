@@ -237,6 +237,7 @@ topics:
 - `properties` passes advanced librdkafka settings through. It cannot override typed fields or Fransson's reliability settings, including `auto.offset.reset=error` for clone checkpoints.
 - `max_in_flight_per_partition` defaults to `64`.
 - Destination brokers are contacted only by `restore` and `run`; `dump` opens only its selected source.
+- The destination principal must be able to enumerate consumer groups, inspect their committed offsets, and delete offsets for managed topics. Fransson needs cluster-wide group visibility so it cannot silently miss a group.
 
 ### Topics
 
@@ -254,6 +255,8 @@ topics:
 Missing destination topics are created normally. An existing topic is drifted when its partition count, explicitly managed replication factor, configured Kafka properties, archive application marker, or saved clone source differs from the configuration. Existing `empty` topics always require recreation, even when their shape matches.
 
 Fransson preflights every destination before changing anything. Required recreation fails safely unless the topic has `force: true` or the invocation uses `--force`. Authorization deletes and recreates the destination topic, clears its state, and reapplies its configured data mode. **This destroys existing destination data.**
+
+Whenever Fransson creates a fresh topic identity—whether the topic was missing or is being recreated—it deletes every discovered consumer group's committed offsets for that topic only. Offsets for unrelated topics remain untouched. An active group subscribed to the topic or missing group permissions fails reconciliation; consumer offsets are never reset optionally or skipped silently.
 
 Destructive reconciliation requires exclusive ownership of the destination topic. Stop producers, consumers, and Kafka Streams applications that can reference it, or disable broker-side topic auto-creation first. If another client recreates the topic between Fransson's delete and create operations, Fransson fails rather than accepting a topic whose identity and contents it does not control.
 

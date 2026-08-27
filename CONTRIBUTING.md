@@ -16,7 +16,7 @@ git diff --check
 
 The Nix version must match `Cargo.toml`.
 
-The ignored reconciliation tests require a disposable Kafka 4.2.0 broker, exercise topic UUID fencing, and delete the uniquely named topics they create:
+The ignored reconciliation tests require a disposable Kafka 4.2.0 broker, exercise topic UUID fencing and consumer-offset reset behavior, and delete the uniquely named topics they create:
 
 ```bash
 FRANSSON_TEST_KAFKA_BOOTSTRAP_SERVERS=localhost:9092 \

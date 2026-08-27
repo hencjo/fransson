@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -29,6 +29,7 @@ use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 
 mod archive;
+mod kafka_consumer_groups;
 mod kafka_identity;
 
 use archive::{ArchiveEvent, ArchiveHeader, ArchiveReader, ArchiveRecord, ArchiveWriter};
@@ -631,6 +632,14 @@ struct CloneBoundary {
 }
 
 type CloneBoundaries = HashMap<String, CloneBoundary>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConsumerOffsetReset {
+    group: String,
+    offsets: Vec<kafka_consumer_groups::ConsumerGroupOffset>,
+}
+
+type ConsumerOffsetResets = HashMap<String, Vec<ConsumerOffsetReset>>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -2444,6 +2453,13 @@ async fn reconcile_destination_topics(
         );
     }
 
+    let fresh_topics: HashSet<&str> = plans
+        .iter()
+        .filter(|plan| !matches!(plan.action, ReconcileAction::None))
+        .map(|plan| topics[plan.topic_index].name.as_str())
+        .collect();
+    let consumer_offset_resets = plan_consumer_offset_resets(&metadata_consumer, &fresh_topics)?;
+
     for plan in plans {
         let topic = &topics[plan.topic_index];
         let recreation_deadline = match plan.action {
@@ -2453,9 +2469,19 @@ async fn reconcile_destination_topics(
         match plan.action {
             ReconcileAction::None => continue,
             ReconcileAction::Create => {
+                apply_consumer_offset_resets(
+                    metadata_consumer.client(),
+                    &topic.name,
+                    &consumer_offset_resets,
+                )?;
                 clear_topic_state(runtime, &topic.name).await?;
             }
             ReconcileAction::Recreate(_) => {
+                apply_consumer_offset_resets(
+                    metadata_consumer.client(),
+                    &topic.name,
+                    &consumer_offset_resets,
+                )?;
                 clear_topic_state(runtime, &topic.name).await?;
                 delete_destination_topic(
                     &admin_client,
@@ -2557,6 +2583,78 @@ async fn reconcile_destination_topics(
         }
     }
 
+    Ok(())
+}
+
+fn plan_consumer_offset_resets(
+    consumer: &StreamConsumer,
+    fresh_topics: &HashSet<&str>,
+) -> Result<ConsumerOffsetResets> {
+    if fresh_topics.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let groups = consumer
+        .fetch_group_list(None, Duration::from_secs(10))
+        .context("failed to enumerate destination consumer groups before topic creation")?;
+    let mut resets = HashMap::<String, Vec<ConsumerOffsetReset>>::new();
+    for group in groups.groups() {
+        if !matches!(group.protocol_type(), "" | "consumer") {
+            continue;
+        }
+        let offsets = kafka_consumer_groups::list_offsets(consumer.client(), group.name())
+            .with_context(|| {
+                format!(
+                    "failed to inspect offsets for destination consumer group {}",
+                    group.name()
+                )
+            })?;
+        for (topic, offsets) in select_offsets_for_topics(offsets, fresh_topics) {
+            resets.entry(topic).or_default().push(ConsumerOffsetReset {
+                group: group.name().to_owned(),
+                offsets,
+            });
+        }
+    }
+    for topic_resets in resets.values_mut() {
+        topic_resets.sort_by(|left, right| left.group.cmp(&right.group));
+        for reset in topic_resets {
+            reset.offsets.sort_by_key(|offset| offset.partition);
+        }
+    }
+    Ok(resets)
+}
+
+fn select_offsets_for_topics(
+    offsets: Vec<kafka_consumer_groups::ConsumerGroupOffset>,
+    topics: &HashSet<&str>,
+) -> HashMap<String, Vec<kafka_consumer_groups::ConsumerGroupOffset>> {
+    let mut selected = HashMap::<String, Vec<_>>::new();
+    for offset in offsets {
+        if topics.contains(offset.topic.as_str()) {
+            selected
+                .entry(offset.topic.clone())
+                .or_default()
+                .push(offset);
+        }
+    }
+    selected
+}
+
+fn apply_consumer_offset_resets<C: rdkafka::client::ClientContext>(
+    client: &rdkafka::client::Client<C>,
+    topic: &str,
+    resets: &ConsumerOffsetResets,
+) -> Result<()> {
+    for reset in resets.get(topic).into_iter().flatten() {
+        kafka_consumer_groups::delete_offsets(client, &reset.group, &reset.offsets).with_context(
+            || {
+                format!(
+                    "failed to reset consumer group {} for fresh destination topic {topic}; stop every consumer subscribed to this topic before retrying",
+                    reset.group
+                )
+            },
+        )?;
+    }
     Ok(())
 }
 
@@ -4039,6 +4137,27 @@ topics:
     }
 
     #[test]
+    fn consumer_offset_resets_select_only_fresh_topics() {
+        let topics = HashSet::from(["fresh"]);
+        let selected = select_offsets_for_topics(
+            vec![
+                kafka_consumer_groups::ConsumerGroupOffset {
+                    topic: "fresh".to_owned(),
+                    partition: 0,
+                },
+                kafka_consumer_groups::ConsumerGroupOffset {
+                    topic: "unrelated".to_owned(),
+                    partition: 1,
+                },
+            ],
+            &topics,
+        );
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected["fresh"][0].partition, 0);
+        assert!(!selected.contains_key("unrelated"));
+    }
+
+    #[test]
     fn destination_topic_presence_distinguishes_errors_from_deletion() {
         assert_eq!(
             classify_destination_topic_presence(false, false),
@@ -4204,6 +4323,81 @@ topics:
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires FRANSSON_TEST_KAFKA_BOOTSTRAP_SERVERS pointing at Kafka 4.2.0"]
+    async fn kafka_consumer_offset_reset_preserves_unrelated_topics() {
+        let config = integration_destination_config();
+        let admin = build_admin_client(&config).unwrap();
+        let metadata = build_consumer_for_destination_metadata(&config).unwrap();
+        let target = empty_managed_topic(integration_topic("offset-reset"));
+        let unrelated = empty_managed_topic(integration_topic("offset-preserve"));
+        for topic in [&target, &unrelated] {
+            create_destination_topic(&admin, &metadata, topic, 1, None)
+                .await
+                .unwrap();
+            wait_for_destination_topic_state(
+                &metadata,
+                &topic.name,
+                Some(1),
+                Instant::now() + TOPIC_RECONCILIATION_TIMEOUT,
+            )
+            .await
+            .unwrap();
+        }
+
+        let group = integration_topic("offset-group");
+        let mut consumer_config = ClientConfig::new();
+        consumer_config
+            .set("bootstrap.servers", &config.bootstrap_servers)
+            .set("group.id", &group)
+            .set("enable.auto.commit", "false");
+        apply_security_config(
+            &mut consumer_config,
+            &config.security_protocol,
+            config.sasl.as_ref(),
+        )
+        .unwrap();
+        let consumer: StreamConsumer = consumer_config.create().unwrap();
+        let mut committed = TopicPartitionList::new();
+        committed
+            .add_partition_offset(&target.name, 0, Offset::Offset(5))
+            .unwrap();
+        committed
+            .add_partition_offset(&unrelated.name, 0, Offset::Offset(7))
+            .unwrap();
+        consumer
+            .commit(&committed, rdkafka::consumer::CommitMode::Sync)
+            .unwrap();
+
+        let offsets = kafka_consumer_groups::list_offsets(metadata.client(), &group).unwrap();
+        let target_offsets: Vec<_> = offsets
+            .iter()
+            .filter(|offset| offset.topic == target.name)
+            .cloned()
+            .collect();
+        assert_eq!(target_offsets.len(), 1);
+        kafka_consumer_groups::delete_offsets(metadata.client(), &group, &target_offsets).unwrap();
+        let offsets = kafka_consumer_groups::list_offsets(metadata.client(), &group).unwrap();
+        assert!(!offsets.iter().any(|offset| offset.topic == target.name));
+        assert!(offsets
+            .iter()
+            .any(|offset| offset.topic == unrelated.name && offset.partition == 0));
+
+        drop(consumer);
+        let options = AdminOptions::new();
+        let _ = admin.delete_groups(&[&group], &options).await;
+        for topic in [&target, &unrelated] {
+            delete_destination_topic(
+                &admin,
+                &metadata,
+                &topic.name,
+                Instant::now() + TOPIC_RECONCILIATION_TIMEOUT,
+            )
+            .await
+            .unwrap();
+        }
     }
 
     #[test]
