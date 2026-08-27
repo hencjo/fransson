@@ -16,7 +16,7 @@ Fransson is deliberately one-way: source connections are read-only and every wri
 | --- | --- | --- | --- | --- |
 | `clone` | Earliest offset, or the last acknowledged offset in state | Yes | `restore`, `run` | Reproducing compacted/reference topics |
 | `stream` | Source end after each startup reconciliation | No | `run` | Forwarding only events produced while Fransson is running |
-| `restore` | Beginning of an archive | Completion marker | `restore`, `run` | Recreating a known topic snapshot |
+| `restore` | Beginning of an archive | Application marker | `restore`, `run` | Recreating a known topic snapshot |
 | `manage` | No data transfer | Topic reconciliation only | `restore`, `run` | Managing shape while preserving matching topics |
 | `empty` | No data transfer | No | `restore`, `run` | Starting every invocation with a new empty topic |
 
@@ -251,7 +251,7 @@ topics:
 
 ## Reconciliation and force
 
-Missing destination topics are created normally. An existing topic is drifted when its partition count, explicitly managed replication factor, configured Kafka properties, archive completion marker, or saved clone source differs from the configuration. Existing `empty` topics always require recreation, even when their shape matches.
+Missing destination topics are created normally. An existing topic is drifted when its partition count, explicitly managed replication factor, configured Kafka properties, archive application marker, or saved clone source differs from the configuration. Existing `empty` topics always require recreation, even when their shape matches.
 
 Fransson preflights every destination before changing anything. Required recreation fails safely unless the topic has `force: true` or the invocation uses `--force`. Authorization deletes and recreates the destination topic, clears its state, and reapplies its configured data mode. **This destroys existing destination data.**
 
@@ -259,18 +259,17 @@ Destructive reconciliation requires exclusive ownership of the destination topic
 
 An `empty` topic is reset once during every `restore` invocation and every `run` startup; Fransson does not keep it empty after applications begin writing. A configuration containing only `manage` or `empty` topics must use `restore`, because `run` requires at least one active clone or stream.
 
-Application writes after a completed restore do not count as drift and do not trigger another restore. If a restore fails partway through, its completion marker is absent; the next reconciliation requires force before recreating the partial destination and trying again.
+Application writes after an applied restore do not count as drift and do not trigger another restore. If a restore fails partway through, its applied marker is absent; the next reconciliation requires force before recreating the partial destination and trying again.
 
 ## State, archives, and delivery
 
-Upgrading an older deployment? Follow [`UPGRADING.md`](UPGRADING.md); the old YAML field and state format are intentionally unsupported.
-
 - `restore` and `run` use `.fransson/state.json` in the current directory by default. `--state-dir DIR` selects persistent storage explicitly; `dump` never reads or writes state.
+- The file is a local work ledger, not a snapshot of declared Kafka contents. `state show` does not contact Kafka, and its entries may be stale until the next reconciliation.
 - State is grouped by Kafka cluster ID and destination topic name, then fenced by immutable topic UUIDs. Clone state also records the source cluster and topic UUIDs. Fransson requires Kafka 2.8 or newer.
 - A missing or mismatched state entry for an existing clone or restore topic fails closed and requires `--force`; state from another cluster can never be applied silently.
 - `fransson state show` prints the registry. `fransson state reset --config FILE --topic TOPIC` resets one configured destination; `--all` resets every destination in that configuration. Resetting state never changes Kafka data.
 - Clone state records the next offset only after destination acknowledgement and is persisted atomically.
-- Restore state records `in_progress` before copying and `complete` with the archive SHA-256 and format version only after every record is acknowledged.
+- Restore state records `applying` before copying and `applied` with the archive SHA-256 and format version only after every record is acknowledged. `applied` does not claim that later application writes, retention, or compaction left the topic equal to the archive.
 - Archives omit topic names and physical Kafka offsets, and are written atomically after all startup high-watermarks have been consumed.
 - Active streams use an idempotent producer and wait through retriable destination outages.
 - Fransson reads only its current state and archive formats; there are no compatibility aliases or migrations for pre-`0.1.0` files.

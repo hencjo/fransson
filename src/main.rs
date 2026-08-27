@@ -56,7 +56,7 @@ enum Command {
     Restore(ConfigArgs),
     /// Reconcile topics, continuously clone, and stream new events
     Run(ConfigArgs),
-    /// Inspect or reset Fransson's local state registry
+    /// Inspect or reset Fransson's local work ledger
     State(StateArgs),
 }
 
@@ -81,7 +81,7 @@ struct StateArgs {
 
 #[derive(Debug, Subcommand)]
 enum StateCommand {
-    /// Print the state registry as JSON
+    /// Print the unverified local work ledger as JSON
     Show(StateShowArgs),
     /// Remove state for configured destination topics
     Reset(StateResetArgs),
@@ -280,7 +280,7 @@ struct RestorePlan {
     archive: PathBuf,
 }
 
-const STATE_FORMAT_VERSION: u16 = 2;
+const STATE_FORMAT_VERSION: u16 = 3;
 const STATE_FILE_NAME: &str = "state.json";
 const STATE_LOCK_NAME: &str = "state.lock";
 
@@ -337,8 +337,8 @@ struct RestoreMarker {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum RestoreStatus {
-    InProgress,
-    Complete,
+    Applying,
+    Applied,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -455,17 +455,17 @@ impl OffsetState {
         self.topics.remove(destination_topic).is_some()
     }
 
-    fn restore_matches(&self, destination_topic: &str, topic_id: &str, fingerprint: &str) -> bool {
+    fn archive_applied(&self, destination_topic: &str, topic_id: &str, fingerprint: &str) -> bool {
         self.topics.get(destination_topic).is_some_and(|state| {
             state.topic_id == topic_id
                 && matches!(&state.state, TopicModeState::Restore(marker)
                     if marker.archive_sha256 == fingerprint
                     && marker.archive_format_version == archive::format_version()
-                    && marker.status == RestoreStatus::Complete)
+                    && marker.status == RestoreStatus::Applied)
         })
     }
 
-    fn mark_restore(
+    fn mark_archive_application(
         &mut self,
         destination_topic: &str,
         topic_id: String,
@@ -2182,15 +2182,15 @@ async fn reconcile_destination_topics(
         } else {
             None
         };
-        let restore_complete = if let (Some(fingerprint), Some(topic_id)) =
+        let archive_applied = if let (Some(fingerprint), Some(topic_id)) =
             (restore_fingerprint.as_deref(), existing_topic_id.as_deref())
         {
             let state = runtime.state.lock().await;
-            state.restore_matches(&topic.name, topic_id, fingerprint)
+            state.archive_applied(&topic.name, topic_id, fingerprint)
         } else {
             topic.restore.is_none()
         };
-        let needs_restore = topic.restore.is_some() && !restore_complete;
+        let needs_restore = topic.restore.is_some() && !archive_applied;
         let clone_state_mismatch = if let Some(transfer) = topic
             .transfer
             .as_ref()
@@ -2216,7 +2216,7 @@ async fn reconcile_destination_topics(
         let reason = mismatch_reason
             .or_else(|| {
                 needs_restore
-                    .then(|| "configured archive has not completed successfully".to_owned())
+                    .then(|| "configured archive has not been applied successfully".to_owned())
             })
             .or(clone_state_mismatch);
         let action = plan_reconcile_action(existing.is_some(), reason);
@@ -2320,11 +2320,11 @@ async fn reconcile_destination_topics(
         if let (Some(restore), Some(fingerprint)) = (&topic.restore, plan.restore_fingerprint) {
             {
                 let mut state = runtime.state.lock().await;
-                state.mark_restore(
+                state.mark_archive_application(
                     &topic.name,
                     topic_id.clone(),
                     fingerprint.clone(),
-                    RestoreStatus::InProgress,
+                    RestoreStatus::Applying,
                 );
             }
             runtime.state_dirty.store(true, Ordering::Release);
@@ -2332,7 +2332,12 @@ async fn reconcile_destination_topics(
             restore_archive(&restore.archive, &topic.name, &runtime.producer).await?;
             {
                 let mut state = runtime.state.lock().await;
-                state.mark_restore(&topic.name, topic_id, fingerprint, RestoreStatus::Complete);
+                state.mark_archive_application(
+                    &topic.name,
+                    topic_id,
+                    fingerprint,
+                    RestoreStatus::Applied,
+                );
             }
             runtime.state_dirty.store(true, Ordering::Release);
             flush_state(runtime, true).await?;
@@ -3334,16 +3339,16 @@ topics:
             0,
             42,
         );
-        state.mark_restore(
+        state.mark_archive_application(
             "destination",
             "destination-topic-id".to_owned(),
             "fingerprint".to_owned(),
-            RestoreStatus::Complete,
+            RestoreStatus::Applied,
         );
 
         assert!(state.clear_topic("destination"));
         assert!(state.next_offset("destination", 0).is_none());
-        assert!(!state.restore_matches("destination", "destination-topic-id", "fingerprint"));
+        assert!(!state.archive_applied("destination", "destination-topic-id", "fingerprint"));
     }
 
     #[test]
@@ -3531,7 +3536,7 @@ topics:
             panic!("expected clone state")
         };
         assert_eq!(clone.source, test_source_identity());
-        assert!(!state.restore_matches("destination", "other-topic-id", "fingerprint"));
+        assert!(!state.archive_applied("destination", "other-topic-id", "fingerprint"));
         assert!(serde_json::from_str::<StateRegistry>(r#"{"clusters":{}}"#).is_err());
     }
 
@@ -3575,24 +3580,57 @@ topics:
     }
 
     #[test]
-    fn restore_state_matches_only_completed_archive_and_topic_identity() {
+    fn restore_state_matches_only_applied_archive_and_topic_identity() {
         let mut state = OffsetState::default();
-        state.mark_restore(
+        state.mark_archive_application(
             "destination",
             "topic-id".to_owned(),
             "archive-hash".to_owned(),
-            RestoreStatus::InProgress,
+            RestoreStatus::Applying,
         );
-        assert!(!state.restore_matches("destination", "topic-id", "archive-hash"));
-        state.mark_restore(
+        assert!(!state.archive_applied("destination", "topic-id", "archive-hash"));
+        state.mark_archive_application(
             "destination",
             "topic-id".to_owned(),
             "archive-hash".to_owned(),
-            RestoreStatus::Complete,
+            RestoreStatus::Applied,
         );
-        assert!(state.restore_matches("destination", "topic-id", "archive-hash"));
-        assert!(!state.restore_matches("destination", "replacement-id", "archive-hash"));
-        assert!(!state.restore_matches("destination", "topic-id", "other-hash"));
+        assert!(state.archive_applied("destination", "topic-id", "archive-hash"));
+        assert!(!state.archive_applied("destination", "replacement-id", "archive-hash"));
+        assert!(!state.archive_applied("destination", "topic-id", "other-hash"));
+    }
+
+    #[test]
+    fn state_v3_uses_application_statuses_and_rejects_v2() {
+        let marker = RestoreMarker {
+            archive_sha256: "archive-hash".to_owned(),
+            archive_format_version: archive::format_version(),
+            status: RestoreStatus::Applying,
+        };
+        let applying = serde_json::to_string(&marker).unwrap();
+        assert!(applying.contains(r#""status":"applying""#));
+        assert!(serde_json::from_str::<RestoreMarker>(
+            &applying.replace("applying", "in_progress")
+        )
+        .is_err());
+
+        let old_registry = r#"{"format_version":2,"clusters":{}}"#;
+        let directory = env::temp_dir().join(format!(
+            "fransson-state-v2-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(STATE_FILE_NAME);
+        fs::write(&path, old_registry).unwrap();
+        assert!(StateRegistry::load(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported state format version 2"));
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -3617,7 +3655,7 @@ topics:
                         state: TopicModeState::Restore(RestoreMarker {
                             archive_sha256: "hash".to_owned(),
                             archive_format_version: archive::format_version(),
-                            status: RestoreStatus::InProgress,
+                            status: RestoreStatus::Applying,
                         }),
                     },
                 )]),
@@ -3663,18 +3701,18 @@ topics:
             .err()
             .expect("same topic lock should fail");
         assert!(collision.to_string().contains("already managed"));
-        state_a.mark_restore(
+        state_a.mark_archive_application(
             "a",
             "a-id".to_owned(),
             "a-hash".to_owned(),
-            RestoreStatus::Complete,
+            RestoreStatus::Applied,
         );
         store_a.persist(&state_a).unwrap();
-        state_b.mark_restore(
+        state_b.mark_archive_application(
             "b",
             "b-id".to_owned(),
             "b-hash".to_owned(),
-            RestoreStatus::Complete,
+            RestoreStatus::Applied,
         );
         store_b.persist(&state_b).unwrap();
 
