@@ -617,7 +617,13 @@ enum ExecutionMode {
     Run,
 }
 
-type CloneEndOffsets = HashMap<String, i64>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CloneBoundary {
+    low: i64,
+    high: i64,
+}
+
+type CloneBoundaries = HashMap<String, CloneBoundary>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -717,11 +723,7 @@ async fn execute_config(
     }
     let clone_topics = collect_clone_topics_by_source(&topics);
     let source_identities = fetch_source_identities(&config.sources, &clone_topics)?;
-    let clone_end_offsets = if mode == ExecutionMode::Restore {
-        fetch_clone_end_offsets(&config.sources, &clone_topics)?
-    } else {
-        HashMap::new()
-    };
+    let clone_boundaries = fetch_clone_boundaries(&config.sources, &clone_topics)?;
     let producer = build_producer(destination)?;
     let destination_cluster_id = kafka_identity::cluster_id(producer.client())
         .context("failed to identify destination Kafka cluster")?;
@@ -760,6 +762,7 @@ async fn execute_config(
         destination,
         &topics,
         &transfer_topics,
+        &clone_boundaries,
         &runtime,
         force,
     )
@@ -796,7 +799,7 @@ async fn execute_config(
         let metadata = fetch_metadata(consumer.as_ref(), &plans)?;
         let assignment = {
             let state = runtime.state.lock().await;
-            build_assignment(&metadata, &plans, &state, &clone_end_offsets)?
+            build_assignment(&metadata, &plans, &state, &clone_boundaries)?
         };
         {
             let state = runtime.state.lock().await;
@@ -833,7 +836,7 @@ async fn execute_config(
                 let partition_id = partition.id();
                 let end_offset = if mode == ExecutionMode::Restore {
                     Some(
-                        *clone_end_offsets
+                        clone_boundaries
                             .get(&clone_boundary_key(
                                 &plan.source.instance,
                                 &plan.source.topic,
@@ -846,7 +849,8 @@ async fn execute_config(
                                     plan.source.topic,
                                     partition_id
                                 )
-                            })?,
+                            })?
+                            .high,
                     )
                 } else {
                     None
@@ -988,6 +992,17 @@ async fn run_partition_loop(
                 finish_partition_inflight(&plan, partition_id, &runtime, &mut inflight, end_offset)
                     .await?;
                 return Ok(());
+            }
+            Err(rdkafka::error::KafkaError::MessageConsumption(
+                RDKafkaErrorCode::AutoOffsetReset,
+            )) => {
+                bail!(
+                    "saved clone offset for {}:{} partition {} is no longer available; recreate destination topic {} with force",
+                    plan.source.instance,
+                    plan.source.topic,
+                    partition_id,
+                    plan.destination_topic
+                );
             }
             Err(err) => {
                 set_partition_error(
@@ -1304,6 +1319,7 @@ fn validate_config(config: &AppConfig) -> Result<()> {
         "enable.auto.commit",
         "enable.auto.offset.store",
         "enable.partition.eof",
+        "auto.offset.reset",
     ];
     const DESTINATION_RESERVED: &[&str] = &[
         "bootstrap.servers",
@@ -1781,6 +1797,52 @@ fn clone_state_mismatch_reason(
     }
 }
 
+fn clone_checkpoint_mismatch_reason(
+    saved: Option<&TopicState>,
+    transfer: &TransferPlan,
+    boundaries: &CloneBoundaries,
+) -> Option<String> {
+    let Some(TopicState {
+        state: TopicModeState::Clone(clone),
+        ..
+    }) = saved
+    else {
+        return None;
+    };
+
+    for (partition, offset) in &clone.next_offsets {
+        let partition = match partition.parse::<i32>() {
+            Ok(partition) if partition >= 0 => partition,
+            _ => return Some(format!("saved clone partition {partition:?} is invalid")),
+        };
+        let key = clone_boundary_key(&transfer.source.instance, &transfer.source.topic, partition);
+        let Some(boundary) = boundaries.get(&key) else {
+            return Some(format!(
+                "saved clone partition {partition} no longer exists on source {}",
+                transfer.source
+            ));
+        };
+        if let Err(error) = validate_clone_checkpoint(*offset, *boundary) {
+            return Some(format!(
+                "saved clone offset {offset} for source {} partition {partition} is unusable: {error}",
+                transfer.source
+            ));
+        }
+    }
+
+    None
+}
+
+fn validate_clone_checkpoint(offset: i64, boundary: CloneBoundary) -> Result<()> {
+    if offset < boundary.low {
+        bail!("offset is below source low watermark {}", boundary.low);
+    }
+    if offset > boundary.high {
+        bail!("offset is beyond source high watermark {}", boundary.high);
+    }
+    Ok(())
+}
+
 fn collect_clone_topics_by_source(topics: &[ManagedTopic]) -> HashMap<String, Vec<TransferPlan>> {
     collect_topics_by_source(topics, Some(TransferKind::Clone))
 }
@@ -1992,6 +2054,8 @@ fn build_source_consumer(
         client.set(key, value);
     }
 
+    client.set("auto.offset.reset", "error");
+
     if partition_eof {
         client.set("enable.partition.eof", "true");
     }
@@ -2106,6 +2170,7 @@ async fn reconcile_destination_topics(
     destination: &DestinationKafkaConfig,
     topics: &[ManagedTopic],
     transfer_topics: &HashMap<String, Vec<TransferPlan>>,
+    clone_boundaries: &CloneBoundaries,
     runtime: &RuntimeContext,
     force: bool,
 ) -> Result<()> {
@@ -2207,6 +2272,13 @@ async fn reconcile_destination_topics(
                     topic_id,
                     configured_source,
                 )
+                .or_else(|| {
+                    clone_checkpoint_mismatch_reason(
+                        state.topics.get(&topic.name),
+                        transfer,
+                        clone_boundaries,
+                    )
+                })
             } else {
                 None
             }
@@ -2716,10 +2788,10 @@ fn fetch_source_partition_counts(
     Ok(counts)
 }
 
-fn fetch_clone_end_offsets(
+fn fetch_clone_boundaries(
     sources: &HashMap<String, SourceKafkaConfig>,
     clone_topics: &HashMap<String, Vec<TransferPlan>>,
-) -> Result<CloneEndOffsets> {
+) -> Result<CloneBoundaries> {
     let mut boundaries = HashMap::new();
     for (source_name, plans) in clone_topics {
         let source_config = sources
@@ -2736,7 +2808,7 @@ fn fetch_clone_end_offsets(
                     anyhow!("missing metadata for source topic {}", plan.source.topic)
                 })?;
             for partition in topic.partitions() {
-                let (_, high) = consumer
+                let (low, high) = consumer
                     .fetch_watermarks(&plan.source.topic, partition.id(), Duration::from_secs(10))
                     .with_context(|| {
                         format!(
@@ -2748,7 +2820,7 @@ fn fetch_clone_end_offsets(
                     })?;
                 boundaries.insert(
                     clone_boundary_key(source_name, &plan.source.topic, partition.id()),
-                    high,
+                    CloneBoundary { low, high },
                 );
             }
         }
@@ -2914,7 +2986,7 @@ fn build_assignment(
     metadata: &Metadata,
     plans: &[TransferPlan],
     state: &OffsetState,
-    end_offsets: &CloneEndOffsets,
+    boundaries: &CloneBoundaries,
 ) -> Result<TopicPartitionList> {
     let mut assignment = TopicPartitionList::new();
 
@@ -2931,22 +3003,20 @@ fn build_assignment(
             } else {
                 None
             };
-            let end_offset = end_offsets.get(&clone_boundary_key(
+            let boundary = boundaries.get(&clone_boundary_key(
                 &plan.source.instance,
                 &plan.source.topic,
                 partition.id(),
             ));
-            if let (Some(saved), Some(end)) = (saved, end_offset) {
-                if saved > *end {
-                    bail!(
-                        "saved offset {} is beyond captured end offset {} for {}:{} partition {}",
-                        saved,
-                        end,
+            if let (Some(saved), Some(boundary)) = (saved, boundary) {
+                validate_clone_checkpoint(saved, *boundary).with_context(|| {
+                    format!(
+                        "invalid saved offset for {}:{} partition {}",
                         plan.source.instance,
                         plan.source.topic,
                         partition.id()
-                    );
-                }
+                    )
+                })?;
             }
             let offset = initial_offset(plan, saved);
 
@@ -3497,6 +3567,21 @@ topics:
             .contains("property group.id is owned by fransson"));
 
         let config: AppConfig = serde_yaml::from_str(
+            r#"sources:
+  primary:
+    bootstrap_servers: localhost:9092
+    group_id: group
+    properties:
+      auto.offset.reset: latest
+"#,
+        )
+        .unwrap();
+        assert!(validate_config(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("property auto.offset.reset is owned by fransson"));
+
+        let config: AppConfig = serde_yaml::from_str(
             r#"destination:
   bootstrap_servers: localhost:9092
   properties:
@@ -3576,6 +3661,37 @@ topics:
             clone_state_mismatch_reason(Some(&trusted), "destination-id", &other_source)
                 .unwrap()
                 .contains("source identity")
+        );
+    }
+
+    #[test]
+    fn clone_checkpoints_must_stay_inside_source_watermarks() {
+        let boundary = CloneBoundary { low: 10, high: 20 };
+        assert!(validate_clone_checkpoint(9, boundary).is_err());
+        assert!(validate_clone_checkpoint(10, boundary).is_ok());
+        assert!(validate_clone_checkpoint(20, boundary).is_ok());
+        assert!(validate_clone_checkpoint(21, boundary).is_err());
+
+        let transfer = TransferPlan {
+            destination_topic: "destination".to_owned(),
+            source: SourceTopicRef {
+                instance: "primary".to_owned(),
+                topic: "source".to_owned(),
+            },
+            kind: TransferKind::Clone,
+        };
+        let saved = TopicState {
+            topic_id: "destination-id".to_owned(),
+            state: TopicModeState::Clone(CloneState {
+                source: test_source_identity(),
+                next_offsets: BTreeMap::from([("0".to_owned(), 9)]),
+            }),
+        };
+        let boundaries = HashMap::from([(clone_boundary_key("primary", "source", 0), boundary)]);
+        assert!(
+            clone_checkpoint_mismatch_reason(Some(&saved), &transfer, &boundaries)
+                .unwrap()
+                .contains("below source low watermark")
         );
     }
 

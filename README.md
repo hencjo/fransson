@@ -234,7 +234,7 @@ topics:
 
 - Every source needs `bootstrap_servers` and an explicit `group_id`. Fransson manually assigns partitions and never commits consumer offsets, but Kafka still checks group authorization.
 - `client_id`, `security_protocol`, and `sasl` are optional. `password_env` names the environment variable holding the SASL password.
-- `properties` passes advanced librdkafka settings through. It cannot override typed fields or Fransson's reliability settings.
+- `properties` passes advanced librdkafka settings through. It cannot override typed fields or Fransson's reliability settings, including `auto.offset.reset=error` for clone checkpoints.
 - `max_in_flight_per_partition` defaults to `64`.
 - Destination brokers are contacted only by `restore` and `run`; `dump` opens only its selected source.
 
@@ -260,6 +260,8 @@ Destructive reconciliation requires exclusive ownership of the destination topic
 An `empty` topic is reset once during every `restore` invocation and every `run` startup; Fransson does not keep it empty after applications begin writing. A configuration containing only `manage` or `empty` topics must use `restore`, because `run` requires at least one active clone or stream.
 
 Application writes after an applied restore do not count as drift and do not trigger another restore. If a restore fails partway through, its applied marker is absent; the next reconciliation requires force before recreating the partial destination and trying again.
+
+Clone checkpoints must remain between the source partition's current low and high watermarks. If source retention removes an unprocessed checkpoint, Fransson fails closed and requires force to rebuild the destination from the source records that remain; it never jumps silently to the source end.
 
 ## State, archives, and delivery
 
