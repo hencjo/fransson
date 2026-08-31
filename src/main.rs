@@ -607,10 +607,25 @@ struct RuntimeContext {
 
 #[derive(Debug, Clone)]
 struct StatusLine {
+    source_name: String,
     destination_topic: String,
     partition: i32,
     next_offset: Option<i64>,
-    last_error: Option<String>,
+    last_error: Option<StatusError>,
+}
+
+#[derive(Debug, Clone)]
+enum StatusError {
+    Partition(String),
+    Source(String),
+}
+
+impl StatusError {
+    fn detail(&self) -> &str {
+        match self {
+            Self::Partition(detail) | Self::Source(detail) => detail,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -2136,6 +2151,7 @@ fn initialize_status_lines(
             status.lines.insert(
                 key,
                 StatusLine {
+                    source_name: plan.source.instance.clone(),
                     destination_topic: plan.destination_topic.clone(),
                     partition: partition.id(),
                     next_offset: if plan.kind == TransferKind::Clone {
@@ -2176,20 +2192,17 @@ async fn set_partition_error(
     let key = status_key(destination_topic, partition);
     let mut status = status.lock().await;
     if let Some(line) = status.lines.get_mut(&key) {
-        line.last_error = Some(error);
+        line.last_error = Some(StatusError::Partition(error));
     }
 }
 
 async fn set_source_error(status: &Arc<Mutex<StatusBoard>>, source_name: &str, error: String) {
     let mut status = status.lock().await;
     for line in status.lines.values_mut() {
-        if line
-            .last_error
-            .as_deref()
-            .is_some_and(|existing| existing.contains(source_name))
-            || line.last_error.is_none()
+        if line.source_name == source_name
+            && !matches!(line.last_error, Some(StatusError::Partition(_)))
         {
-            line.last_error = Some(error.clone());
+            line.last_error = Some(StatusError::Source(error.clone()));
         }
     }
 }
@@ -2216,8 +2229,8 @@ fn render_status_board(status: &StatusBoard) -> String {
                 .map(|offset| offset.to_string())
                 .unwrap_or_else(|| "-".to_owned());
             let destination = format!("{} - {}", line.destination_topic, line.partition);
-            let (status_label, color, detail) = match line.last_error.as_deref() {
-                Some(error) => ("error", RED, error),
+            let (status_label, color, detail) = match line.last_error.as_ref() {
+                Some(error) => ("error", RED, error.detail()),
                 None if line.next_offset.is_some() => ("ok", GREEN, ""),
                 None => ("starting", YELLOW, ""),
             };
@@ -4054,6 +4067,55 @@ topics:
             &KafkaError::MessageConsumptionFatal(RDKafkaErrorCode::Fatal),
             TransferKind::Clone
         ));
+    }
+
+    #[tokio::test]
+    async fn source_errors_only_update_matching_source_rows() {
+        let line = |source_name: &str, last_error| StatusLine {
+            source_name: source_name.to_owned(),
+            destination_topic: "destination".to_owned(),
+            partition: 0,
+            next_offset: None,
+            last_error,
+        };
+        let status = Arc::new(Mutex::new(StatusBoard {
+            order: Vec::new(),
+            lines: HashMap::from([
+                ("a-healthy".to_owned(), line("source-a", None)),
+                (
+                    "a-partition-error".to_owned(),
+                    line(
+                        "source-a",
+                        Some(StatusError::Partition("partition failed".to_owned())),
+                    ),
+                ),
+                (
+                    "a-source-error".to_owned(),
+                    line(
+                        "source-a",
+                        Some(StatusError::Source("old source error".to_owned())),
+                    ),
+                ),
+                ("b-healthy".to_owned(), line("source-b", None)),
+            ]),
+        }));
+
+        set_source_error(&status, "source-a", "source failed".to_owned()).await;
+
+        let status = status.lock().await;
+        assert!(matches!(
+            status.lines["a-healthy"].last_error,
+            Some(StatusError::Source(ref detail)) if detail == "source failed"
+        ));
+        assert!(matches!(
+            status.lines["a-partition-error"].last_error,
+            Some(StatusError::Partition(ref detail)) if detail == "partition failed"
+        ));
+        assert!(matches!(
+            status.lines["a-source-error"].last_error,
+            Some(StatusError::Source(ref detail)) if detail == "source failed"
+        ));
+        assert!(status.lines["b-healthy"].last_error.is_none());
     }
 
     #[test]
