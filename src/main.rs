@@ -862,6 +862,7 @@ async fn execute_config(
                     })?;
                 let runtime = runtime.clone();
                 let plan = plan.clone();
+                let worker_consumer = consumer.clone();
                 let partition_id = partition.id();
                 let end_offset = if mode == ExecutionMode::Restore {
                     Some(
@@ -889,6 +890,7 @@ async fn execute_config(
                         plan,
                         partition_id,
                         partition_queue,
+                        worker_consumer,
                         runtime,
                         max_in_flight_per_partition,
                         end_offset,
@@ -987,6 +989,7 @@ async fn run_partition_loop(
     plan: TransferPlan,
     partition_id: i32,
     partition_queue: StreamPartitionQueue<DefaultConsumerContext>,
+    consumer: Arc<StreamConsumer>,
     runtime: RuntimeContext,
     max_in_flight_per_partition: usize,
     end_offset: Option<i64>,
@@ -1022,9 +1025,29 @@ async fn run_partition_loop(
                 }
                 message
             }
-            Err(rdkafka::error::KafkaError::PartitionEOF(_)) if end_offset.is_some() => {
-                finish_partition_inflight(&plan, partition_id, &runtime, &mut inflight, end_offset)
-                    .await?;
+            Err(rdkafka::error::KafkaError::PartitionEOF(id)) => {
+                let required_offset = end_offset.with_context(|| {
+                    format!(
+                        "received unexpected EOF for unbounded source {}",
+                        plan.source
+                    )
+                })?;
+                ensure_expected_eof_partition(id, partition_id)
+                    .with_context(|| format!("invalid EOF for source {}", plan.source))?;
+                ensure_consumer_reached(
+                    consumer.as_ref(),
+                    &plan.source.topic,
+                    partition_id,
+                    required_offset,
+                )?;
+                finish_partition_inflight(
+                    &plan,
+                    partition_id,
+                    &runtime,
+                    &mut inflight,
+                    Some(required_offset),
+                )
+                .await?;
                 return Ok(());
             }
             Err(rdkafka::error::KafkaError::MessageConsumption(
@@ -1725,7 +1748,11 @@ async fn dump_topic_to_path(
                     }
                     Ok(message) if message.offset() >= high => break,
                     Ok(message) => writer.write_record(&archive_record_from_message(&message))?,
-                    Err(rdkafka::error::KafkaError::PartitionEOF(id)) if id == *partition => break,
+                    Err(rdkafka::error::KafkaError::PartitionEOF(id)) => {
+                        ensure_expected_eof_partition(id, *partition)?;
+                        ensure_consumer_reached(consumer, topic, *partition, high)?;
+                        break;
+                    }
                     Err(error) => bail!(
                         "consumer error while dumping {} partition {} using group {}: {}",
                         topic,
@@ -1740,6 +1767,43 @@ async fn dump_topic_to_path(
     }
     consumer.unassign()?;
     writer.finish()
+}
+
+fn ensure_expected_eof_partition(actual: i32, expected: i32) -> Result<()> {
+    if actual != expected {
+        bail!("received EOF for partition {actual} while consuming partition {expected}");
+    }
+    Ok(())
+}
+
+fn ensure_consumer_reached(
+    consumer: &StreamConsumer,
+    topic: &str,
+    partition: i32,
+    required_offset: i64,
+) -> Result<()> {
+    let positions = consumer.position().with_context(|| {
+        format!("failed to read consumer position for {topic} partition {partition}")
+    })?;
+    let position = positions
+        .find_partition(topic, partition)
+        .with_context(|| format!("consumer position omitted {topic} partition {partition}"))?
+        .offset();
+    ensure_offset_reached(position, required_offset).with_context(|| {
+        format!("consumer reached EOF before captured end offset for {topic} partition {partition}")
+    })
+}
+
+fn ensure_offset_reached(position: Offset, required_offset: i64) -> Result<()> {
+    match position {
+        Offset::Offset(position) if position >= required_offset => Ok(()),
+        Offset::Offset(position) => bail!(
+            "consumer position is {position}, below required offset {required_offset}"
+        ),
+        position => bail!(
+            "consumer position is {position:?}, expected a concrete offset at or beyond {required_offset}"
+        ),
+    }
 }
 
 fn archive_record_from_message(message: &impl Message) -> ArchiveRecord {
@@ -3954,6 +4018,16 @@ topics:
                 .unwrap()
                 .contains("below source low watermark")
         );
+    }
+
+    #[test]
+    fn bounded_eof_requires_the_captured_offset_and_partition() {
+        assert!(ensure_offset_reached(Offset::Offset(20), 20).is_ok());
+        assert!(ensure_offset_reached(Offset::Offset(21), 20).is_ok());
+        assert!(ensure_offset_reached(Offset::Offset(19), 20).is_err());
+        assert!(ensure_offset_reached(Offset::Invalid, 20).is_err());
+        assert!(ensure_expected_eof_partition(2, 2).is_ok());
+        assert!(ensure_expected_eof_partition(1, 2).is_err());
     }
 
     #[test]
