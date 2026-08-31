@@ -18,7 +18,7 @@ use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{
     stream_consumer::StreamPartitionQueue, Consumer, DefaultConsumerContext, StreamConsumer,
 };
-use rdkafka::error::RDKafkaErrorCode;
+use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::message::{Header, Headers, Message, OwnedHeaders, OwnedMessage};
 use rdkafka::metadata::{Metadata, MetadataTopic};
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
@@ -1025,7 +1025,7 @@ async fn run_partition_loop(
                 }
                 message
             }
-            Err(rdkafka::error::KafkaError::PartitionEOF(id)) => {
+            Err(KafkaError::PartitionEOF(id)) => {
                 let required_offset = end_offset.with_context(|| {
                     format!(
                         "received unexpected EOF for unbounded source {}",
@@ -1050,9 +1050,7 @@ async fn run_partition_loop(
                 .await?;
                 return Ok(());
             }
-            Err(rdkafka::error::KafkaError::MessageConsumption(
-                RDKafkaErrorCode::AutoOffsetReset,
-            )) => {
+            Err(err) if is_expired_clone_offset(&err, plan.kind) => {
                 bail!(
                     "saved clone offset for {}:{} partition {} is no longer available; recreate destination topic {} with force",
                     plan.source.instance,
@@ -1062,17 +1060,18 @@ async fn run_partition_loop(
                 );
             }
             Err(err) => {
+                let detail = format!(
+                    "consumer error on source {} partition {}: {}",
+                    plan.source.instance, partition_id, err
+                );
                 set_partition_error(
                     &runtime.status,
                     &plan.destination_topic,
                     partition_id,
-                    format!(
-                        "consumer error on source {} partition {}: {}",
-                        plan.source.instance, partition_id, err
-                    ),
+                    detail.clone(),
                 )
                 .await;
-                continue;
+                bail!(detail);
             }
         };
         inflight.push_back(send_owned_message(
@@ -1167,15 +1166,22 @@ async fn run_event_pump(
                 }
             }
             Err(err) => {
-                set_source_error(
-                    &runtime.status,
-                    &source_name,
-                    format!("consumer error on source {source_name}: {err}"),
-                )
-                .await;
+                let detail = format!("consumer error on source {source_name}: {err}");
+                set_source_error(&runtime.status, &source_name, detail.clone()).await;
+                bail!(detail);
             }
         }
     }
+}
+
+fn is_expired_clone_offset(error: &KafkaError, transfer_kind: TransferKind) -> bool {
+    matches!(
+        (error, transfer_kind),
+        (
+            KafkaError::MessageConsumption(RDKafkaErrorCode::AutoOffsetReset),
+            TransferKind::Clone
+        )
+    )
 }
 
 struct DeliveryResult {
@@ -4028,6 +4034,26 @@ topics:
         assert!(ensure_offset_reached(Offset::Invalid, 20).is_err());
         assert!(ensure_expected_eof_partition(2, 2).is_ok());
         assert!(ensure_expected_eof_partition(1, 2).is_err());
+    }
+
+    #[test]
+    fn consumer_errors_only_special_case_expired_offsets() {
+        assert!(is_expired_clone_offset(
+            &KafkaError::MessageConsumption(RDKafkaErrorCode::AutoOffsetReset),
+            TransferKind::Clone
+        ));
+        assert!(!is_expired_clone_offset(
+            &KafkaError::MessageConsumption(RDKafkaErrorCode::AutoOffsetReset),
+            TransferKind::Stream
+        ));
+        assert!(!is_expired_clone_offset(
+            &KafkaError::MessageConsumption(RDKafkaErrorCode::GroupAuthorizationFailed),
+            TransferKind::Clone
+        ));
+        assert!(!is_expired_clone_offset(
+            &KafkaError::MessageConsumptionFatal(RDKafkaErrorCode::Fatal),
+            TransferKind::Clone
+        ));
     }
 
     #[test]
