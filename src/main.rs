@@ -54,7 +54,7 @@ enum Command {
     /// Create a deterministic archive through a topic's startup high-watermarks
     Dump(DumpArgs),
     /// Reconcile topics, apply archives, and clone through startup high-watermarks
-    Restore(ConfigArgs),
+    Restore(RestoreArgs),
     /// Reconcile topics, continuously clone, and stream new events
     Run(ConfigArgs),
     /// Inspect or reset Fransson's local work ledger
@@ -72,6 +72,28 @@ struct ConfigArgs {
     /// Authorize every required destination topic recreation
     #[arg(long)]
     force: bool,
+}
+
+#[derive(Debug, Args)]
+struct RestoreArgs {
+    /// YAML configuration file
+    #[arg(short, long, value_name = "FILE")]
+    config: PathBuf,
+    /// Persistent state directory
+    #[arg(long, value_name = "DIR", default_value = ".fransson")]
+    state_dir: PathBuf,
+    /// Authorize every required destination topic recreation
+    #[arg(long)]
+    force: bool,
+    /// Restore only missing or empty destination topics
+    #[arg(long, conflicts_with = "reset")]
+    only_if_empty: bool,
+    /// Recreate and reapply every configured restore topic
+    #[arg(long, requires = "force", conflicts_with = "only_if_empty")]
+    reset: bool,
+    /// Wait for each Kafka cluster to accept metadata requests
+    #[arg(long, value_name = "DURATION", value_parser = parse_positive_duration)]
+    wait_for_broker: Option<Duration>,
 }
 
 #[derive(Debug, Args)]
@@ -113,19 +135,35 @@ struct StateResetArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(group(clap::ArgGroup::new("dump_mode").required(true).multiple(false).args(["source", "all"])))]
 struct DumpArgs {
     /// YAML configuration file containing the selected source
     #[arg(short, long, value_name = "FILE")]
     config: PathBuf,
     /// Source topic in SOURCE:TOPIC form
-    #[arg(long, value_name = "SOURCE:TOPIC")]
-    source: String,
+    #[arg(long, value_name = "SOURCE:TOPIC", requires = "archive")]
+    source: Option<String>,
     /// Archive file to create
-    #[arg(short = 'a', long, value_name = "FILE")]
-    archive: PathBuf,
+    #[arg(short = 'a', long, value_name = "FILE", requires = "source")]
+    archive: Option<PathBuf>,
+    /// Dump every configured restore topic
+    #[arg(long, requires = "source_cluster")]
+    all: bool,
+    /// Source cluster name for --all
+    #[arg(long, value_name = "SOURCE", requires = "all")]
+    source_cluster: Option<String>,
     /// Replace an existing archive
     #[arg(long)]
     force: bool,
+    /// Wait for the source Kafka cluster to accept metadata requests
+    #[arg(long, value_name = "DURATION", value_parser = parse_positive_duration)]
+    wait_for_broker: Option<Duration>,
+}
+
+#[derive(Debug, Clone)]
+struct DumpJob {
+    topic: String,
+    archive: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
@@ -279,6 +317,13 @@ enum StaticTopicKind {
 #[derive(Debug, Clone)]
 struct RestorePlan {
     archive: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct ArchiveInspection {
+    partition_count: i32,
+    fingerprint: String,
+    has_records: bool,
 }
 
 const STATE_FORMAT_VERSION: u16 = 3;
@@ -641,6 +686,32 @@ enum ExecutionMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestorePolicy {
+    Normal,
+    OnlyIfEmpty,
+    Reset,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TopicReport {
+    Skipped { topic: String, reason: String },
+    Created { topic: String },
+    Restored { topic: String, archive: PathBuf },
+}
+
+impl fmt::Display for TopicReport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Skipped { topic, reason } => write!(formatter, "skipped {topic}: {reason}"),
+            Self::Created { topic } => write!(formatter, "created {topic}"),
+            Self::Restored { topic, archive } => {
+                write!(formatter, "restored {topic} from {}", archive.display())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CloneBoundary {
     low: i64,
     high: i64,
@@ -662,16 +733,33 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Dump(args) => dump_topic(args).await,
         Command::Restore(args) => {
+            let restore_policy = if args.reset {
+                RestorePolicy::Reset
+            } else if args.only_if_empty {
+                RestorePolicy::OnlyIfEmpty
+            } else {
+                RestorePolicy::Normal
+            };
             execute_config(
                 args.config,
                 args.state_dir,
                 ExecutionMode::Restore,
                 args.force,
+                restore_policy,
+                args.wait_for_broker,
             )
             .await
         }
         Command::Run(args) => {
-            execute_config(args.config, args.state_dir, ExecutionMode::Run, args.force).await
+            execute_config(
+                args.config,
+                args.state_dir,
+                ExecutionMode::Run,
+                args.force,
+                RestorePolicy::Normal,
+                None,
+            )
+            .await
         }
         Command::State(args) => execute_state_command(args).await,
     }
@@ -737,6 +825,8 @@ async fn execute_config(
     state_dir: PathBuf,
     mode: ExecutionMode,
     force: bool,
+    restore_policy: RestorePolicy,
+    wait_for_broker: Option<Duration>,
 ) -> Result<()> {
     let config = load_config(&config_path)?;
     validate_config(&config)?;
@@ -748,15 +838,21 @@ async fn execute_config(
         bail!("topics must contain at least one destination for restore and run");
     }
     let topics = resolve_topics(&config, &config_path)?;
+    validate_restore_policy_topics(&topics, restore_policy)?;
     let transfer_topics = collect_transfer_topics_by_source(&topics);
     if mode == ExecutionMode::Run && transfer_topics.is_empty() {
         bail!("run requires at least one clone or stream topic");
     }
     let clone_topics = collect_clone_topics_by_source(&topics);
-    let source_identity_context = fetch_source_identities(&config.sources, &clone_topics)?;
-    let clone_boundaries = fetch_clone_boundaries(&config.sources, &clone_topics)?;
+    let source_identity_context =
+        fetch_source_identities(&config.sources, &clone_topics, wait_for_broker)?;
+    let clone_boundaries = fetch_clone_boundaries(&config.sources, &clone_topics, wait_for_broker)?;
+    let destination_metadata_consumer = build_consumer_for_destination_metadata(destination)?;
+    let destination_metadata =
+        fetch_metadata_with_wait(&destination_metadata_consumer, None, wait_for_broker)
+            .context("failed to connect to destination Kafka cluster")?;
     let producer = build_producer(destination)?;
-    let destination_cluster_id = kafka_identity::cluster_id(producer.client())
+    let destination_cluster_id = kafka_identity::cluster_id(destination_metadata_consumer.client())
         .context("failed to identify destination Kafka cluster")?;
     let stream_producer = if mode == ExecutionMode::Run
         && topics.iter().any(|topic| {
@@ -801,15 +897,19 @@ async fn execute_config(
         ),
     };
 
-    reconcile_destination_topics(
-        &config.sources,
+    let topic_reports = reconcile_destination_topics(ReconcileRequest {
+        sources: &config.sources,
         destination,
-        &topics,
-        &transfer_topics,
-        &clone_boundaries,
-        &runtime,
+        metadata_consumer: &destination_metadata_consumer,
+        destination_metadata: &destination_metadata,
+        topics: &topics,
+        transfer_topics: &transfer_topics,
+        clone_boundaries: &clone_boundaries,
+        runtime: &runtime,
         force,
-    )
+        restore_policy,
+        wait_for_broker,
+    })
     .await?;
     clear_non_stateful_topic_state(&topics, &runtime).await?;
     {
@@ -840,7 +940,7 @@ async fn execute_config(
         } else {
             build_consumer(source_config)?
         });
-        let metadata = fetch_metadata(consumer.as_ref(), &plans)?;
+        let metadata = fetch_metadata(consumer.as_ref(), &plans, wait_for_broker)?;
         let assignment = {
             let state = runtime.state.lock().await;
             build_assignment(&metadata, &plans, &state, &clone_boundaries)?
@@ -989,9 +1089,22 @@ async fn execute_config(
         flush_result?;
     }
 
+    if mode == ExecutionMode::Restore {
+        for report in topic_reports {
+            println!("{report}");
+        }
+    }
+
     let mut stdout = io::stdout().lock();
     let _ = writeln!(stdout);
 
+    Ok(())
+}
+
+fn validate_restore_policy_topics(topics: &[ManagedTopic], policy: RestorePolicy) -> Result<()> {
+    if policy != RestorePolicy::Normal && topics.iter().any(|topic| topic.restore.is_none()) {
+        bail!("--only-if-empty and --reset require every configured topic to use restore mode");
+    }
     Ok(())
 }
 
@@ -1487,6 +1600,77 @@ fn absolute_path(path: &Path) -> Result<PathBuf> {
     }
 }
 
+fn parse_positive_duration(value: &str) -> std::result::Result<Duration, String> {
+    let split = value
+        .find(|character: char| !character.is_ascii_digit())
+        .ok_or_else(|| "duration requires a unit: ms, s, m, or h".to_owned())?;
+    let amount = value[..split]
+        .parse::<u64>()
+        .map_err(|_| "duration must start with a positive integer".to_owned())?;
+    if amount == 0 {
+        return Err("duration must be greater than zero".to_owned());
+    }
+    let unit = &value[split..];
+    match unit {
+        "ms" => Ok(Duration::from_millis(amount)),
+        "s" => Ok(Duration::from_secs(amount)),
+        "m" => Duration::from_secs(amount)
+            .checked_mul(60)
+            .ok_or_else(|| "duration is too large".to_owned()),
+        "h" => Duration::from_secs(amount)
+            .checked_mul(60 * 60)
+            .ok_or_else(|| "duration is too large".to_owned()),
+        _ => Err("duration unit must be ms, s, m, or h".to_owned()),
+    }
+}
+
+fn fetch_metadata_with_wait(
+    consumer: &StreamConsumer,
+    topic: Option<&str>,
+    wait: Option<Duration>,
+) -> std::result::Result<Metadata, KafkaError> {
+    let deadline = wait.map(|duration| Instant::now() + duration);
+    loop {
+        let timeout = match deadline {
+            Some(deadline) => deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_secs(10)),
+            None => Duration::from_secs(10),
+        };
+        match consumer.fetch_metadata(topic, timeout) {
+            Ok(metadata) => return Ok(metadata),
+            Err(error)
+                if deadline.is_some()
+                    && is_transient_metadata_error(&error)
+                    && deadline.is_some_and(|deadline| Instant::now() < deadline) =>
+            {
+                let remaining = deadline
+                    .and_then(|deadline| deadline.checked_duration_since(Instant::now()))
+                    .unwrap_or_default();
+                std::thread::sleep(remaining.min(TOPIC_RECONCILIATION_POLL_INTERVAL));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn is_transient_metadata_error(error: &KafkaError) -> bool {
+    matches!(
+        error,
+        KafkaError::MetadataFetch(
+            RDKafkaErrorCode::BrokerTransportFailure
+                | RDKafkaErrorCode::Resolve
+                | RDKafkaErrorCode::AllBrokersDown
+                | RDKafkaErrorCode::OperationTimedOut
+                | RDKafkaErrorCode::TimedOutQueue
+                | RDKafkaErrorCode::RequestTimedOut
+                | RDKafkaErrorCode::BrokerNotAvailable
+                | RDKafkaErrorCode::LeaderNotAvailable
+                | RDKafkaErrorCode::NetworkException
+        )
+    )
+}
+
 fn validate_config(config: &AppConfig) -> Result<()> {
     const SOURCE_RESERVED: &[&str] = &[
         "bootstrap.servers",
@@ -1637,39 +1821,126 @@ fn validate_properties(
 }
 
 async fn dump_topic(args: DumpArgs) -> Result<()> {
-    if args.archive.exists() && !args.force {
-        bail!(
-            "output archive {} already exists; use --force to replace it",
-            args.archive.display()
-        );
-    }
-
     let config = load_config(&args.config)?;
     validate_config(&config)?;
-    let _ = resolve_topics(&config, &args.config)?;
-    let source = parse_source_topic_ref(&args.source)
-        .with_context(|| format!("invalid dump source reference {}", args.source))?;
+    let topics = resolve_topics(&config, &args.config)?;
+    let (source_name, jobs) = if args.all {
+        let source_name = args
+            .source_cluster
+            .as_ref()
+            .context("--source-cluster is required with --all")?
+            .clone();
+        let jobs: Vec<DumpJob> = topics
+            .iter()
+            .filter_map(|topic| {
+                topic.restore.as_ref().map(|restore| DumpJob {
+                    topic: topic.name.clone(),
+                    archive: restore.archive.clone(),
+                })
+            })
+            .collect();
+        if jobs.is_empty() {
+            bail!("--all requires at least one configured restore topic");
+        }
+        (source_name, jobs)
+    } else {
+        let source_value = args.source.as_deref().context("--source is required")?;
+        let source = parse_source_topic_ref(source_value)
+            .with_context(|| format!("invalid dump source reference {source_value}"))?;
+        let archive = args.archive.clone().context("--archive is required")?;
+        (
+            source.instance,
+            vec![DumpJob {
+                topic: source.topic,
+                archive,
+            }],
+        )
+    };
+    preflight_dump_outputs(&jobs, args.force)?;
+
     let source_config = config
         .sources
-        .get(&source.instance)
-        .ok_or_else(|| anyhow!("dump references unknown source {}", source.instance))?;
+        .get(&source_name)
+        .ok_or_else(|| anyhow!("dump references unknown source {source_name}"))?;
     let group_id = source_consumer_group_id(source_config);
     let consumer = build_dump_consumer(source_config)?;
+    fetch_metadata_with_wait(&consumer, None, args.wait_for_broker)
+        .with_context(|| format!("failed to connect to Kafka source {source_name}"))?;
+    for job in jobs {
+        dump_job(&consumer, &source_name, group_id, &job).await?;
+    }
+    Ok(())
+}
+
+fn preflight_dump_outputs(jobs: &[DumpJob], force: bool) -> Result<()> {
+    let mut paths = HashMap::<PathBuf, &str>::new();
+    let mut duplicates = Vec::new();
+    let mut conflicts = Vec::new();
+    for job in jobs {
+        let normalized = normalize_absolute_path(&job.archive)?;
+        if let Some(existing) = paths.insert(normalized, &job.topic) {
+            duplicates.push(format!(
+                "{} and {} both write {}",
+                existing,
+                job.topic,
+                job.archive.display()
+            ));
+        }
+        if job.archive.exists() && !force {
+            conflicts.push(job.archive.display().to_string());
+        }
+    }
+    if !duplicates.is_empty() {
+        bail!(
+            "duplicate dump archive paths:\n- {}",
+            duplicates.join("\n- ")
+        );
+    }
+    if !conflicts.is_empty() {
+        bail!(
+            "output archives already exist; use --force to replace them:\n- {}",
+            conflicts.join("\n- ")
+        );
+    }
+    Ok(())
+}
+
+fn normalize_absolute_path(path: &Path) -> Result<PathBuf> {
+    let absolute = absolute_path(path)?;
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            component => normalized.push(component.as_os_str()),
+        }
+    }
+    Ok(normalized)
+}
+
+async fn dump_job(
+    consumer: &StreamConsumer,
+    source_name: &str,
+    group_id: &str,
+    job: &DumpJob,
+) -> Result<()> {
     let metadata = consumer
-        .fetch_metadata(Some(&source.topic), Duration::from_secs(10))
+        .fetch_metadata(Some(&job.topic), Duration::from_secs(10))
         .with_context(|| {
             format!(
                 "failed to fetch metadata for dump source {}:{}",
-                source.instance, source.topic
+                source_name, job.topic
             )
         })?;
     let metadata_topic = metadata
         .topics()
         .iter()
-        .find(|topic| topic.name() == source.topic)
-        .ok_or_else(|| anyhow!("source topic {} not found", source.topic))?;
+        .find(|topic| topic.name() == job.topic)
+        .ok_or_else(|| anyhow!("source topic {} not found", job.topic))?;
     if let Some(error) = metadata_topic.error() {
-        bail!("source topic {} metadata error: {:?}", source.topic, error);
+        bail!("source topic {} metadata error: {:?}", job.topic, error);
     }
 
     let mut partitions: Vec<i32> = metadata_topic
@@ -1681,19 +1952,19 @@ async fn dump_topic(args: DumpArgs) -> Result<()> {
     let mut watermarks = HashMap::new();
     for partition in &partitions {
         let bounds = consumer
-            .fetch_watermarks(&source.topic, *partition, Duration::from_secs(10))
+            .fetch_watermarks(&job.topic, *partition, Duration::from_secs(10))
             .with_context(|| {
                 format!(
                     "failed to fetch watermarks for {} partition {}",
-                    source.topic, partition
+                    job.topic, partition
                 )
             })?;
         watermarks.insert(*partition, bounds);
     }
 
-    let temp_path = args.archive.with_extension(format!(
+    let temp_path = job.archive.with_extension(format!(
         "{}.{}.tmp",
-        args.archive
+        job.archive
             .extension()
             .and_then(|extension| extension.to_str())
             .unwrap_or("archive"),
@@ -1709,8 +1980,8 @@ async fn dump_topic(args: DumpArgs) -> Result<()> {
     }
 
     let result = dump_topic_to_path(
-        &consumer,
-        &source.topic,
+        consumer,
+        &job.topic,
         &partitions,
         &watermarks,
         group_id,
@@ -1721,20 +1992,20 @@ async fn dump_topic(args: DumpArgs) -> Result<()> {
         let _ = fs::remove_file(&temp_path);
         return Err(error);
     }
-    fs::rename(&temp_path, &args.archive).with_context(|| {
+    fs::rename(&temp_path, &job.archive).with_context(|| {
         format!(
             "failed to move completed archive {} to {}",
             temp_path.display(),
-            args.archive.display()
+            job.archive.display()
         )
     })?;
 
     println!(
         "dumped {}:{} to {} ({})",
-        source.instance,
-        source.topic,
-        args.archive.display(),
-        archive::fingerprint(&args.archive)?
+        source_name,
+        job.topic,
+        job.archive.display(),
+        archive::fingerprint(&job.archive)?
     );
     Ok(())
 }
@@ -1825,6 +2096,39 @@ fn ensure_offset_reached(position: Offset, required_offset: i64) -> Result<()> {
             "consumer position is {position:?}, expected a concrete offset at or beyond {required_offset}"
         ),
     }
+}
+
+async fn destination_topic_has_records(
+    consumer: &StreamConsumer,
+    topic: &MetadataTopic,
+) -> Result<bool> {
+    for partition in topic.partitions() {
+        let (low, high) =
+            consumer.fetch_watermarks(topic.name(), partition.id(), Duration::from_secs(10))?;
+        let mut assignment = TopicPartitionList::new();
+        assignment.add_partition_offset(topic.name(), partition.id(), Offset::Offset(low))?;
+        consumer.assign(&assignment)?;
+        match consumer.recv().await {
+            Ok(_) => {
+                consumer.unassign()?;
+                return Ok(true);
+            }
+            Err(KafkaError::PartitionEOF(id)) => {
+                ensure_expected_eof_partition(id, partition.id())?;
+                if low < high {
+                    ensure_consumer_reached(consumer, topic.name(), partition.id(), high)?;
+                }
+            }
+            Err(error) => bail!(
+                "consumer error while checking {} partition {} for records: {}",
+                topic.name(),
+                partition.id(),
+                error
+            ),
+        }
+    }
+    consumer.unassign()?;
+    Ok(false)
 }
 
 fn archive_record_from_message(message: &impl Message) -> ArchiveRecord {
@@ -2071,6 +2375,7 @@ fn collect_clone_topics_by_source(topics: &[ManagedTopic]) -> HashMap<String, Ve
 fn fetch_source_identities(
     sources: &HashMap<String, SourceKafkaConfig>,
     grouped: &HashMap<String, Vec<TransferPlan>>,
+    wait_for_broker: Option<Duration>,
 ) -> Result<SourceIdentityContext> {
     let mut identities = HashMap::new();
     let mut clients = HashMap::new();
@@ -2079,6 +2384,8 @@ fn fetch_source_identities(
             .get(source_name)
             .ok_or_else(|| anyhow!("missing source configuration for {source_name}"))?;
         let consumer = Arc::new(build_source_consumer(config, true)?);
+        fetch_metadata_with_wait(consumer.as_ref(), None, wait_for_broker)
+            .with_context(|| format!("failed to connect to source Kafka cluster {source_name}"))?;
         let cluster_id = kafka_identity::cluster_id(consumer.client())
             .with_context(|| format!("failed to identify source Kafka cluster {source_name}"))?;
         for plan in plans {
@@ -2390,46 +2697,42 @@ fn build_stream_producer(config: &DestinationKafkaConfig) -> Result<FutureProduc
         .context("failed to create Kafka stream producer")
 }
 
-async fn reconcile_destination_topics(
-    sources: &HashMap<String, SourceKafkaConfig>,
-    destination: &DestinationKafkaConfig,
-    topics: &[ManagedTopic],
-    transfer_topics: &HashMap<String, Vec<TransferPlan>>,
-    clone_boundaries: &CloneBoundaries,
-    runtime: &RuntimeContext,
+struct ReconcileRequest<'a> {
+    sources: &'a HashMap<String, SourceKafkaConfig>,
+    destination: &'a DestinationKafkaConfig,
+    metadata_consumer: &'a StreamConsumer,
+    destination_metadata: &'a Metadata,
+    topics: &'a [ManagedTopic],
+    transfer_topics: &'a HashMap<String, Vec<TransferPlan>>,
+    clone_boundaries: &'a CloneBoundaries,
+    runtime: &'a RuntimeContext,
     force: bool,
-) -> Result<()> {
-    let admin_client = build_admin_client(destination)?;
-    let metadata_consumer = build_consumer_for_destination_metadata(destination)?;
-    let destination_metadata = metadata_consumer
-        .fetch_metadata(None, Duration::from_secs(10))
-        .context("failed to fetch destination metadata")?;
+    restore_policy: RestorePolicy,
+    wait_for_broker: Option<Duration>,
+}
 
-    let source_partition_counts = fetch_source_partition_counts(sources, transfer_topics)?;
+async fn reconcile_destination_topics(request: ReconcileRequest<'_>) -> Result<Vec<TopicReport>> {
+    let ReconcileRequest {
+        sources,
+        destination,
+        metadata_consumer,
+        destination_metadata,
+        topics,
+        transfer_topics,
+        clone_boundaries,
+        runtime,
+        force,
+        restore_policy,
+        wait_for_broker,
+    } = request;
+    let admin_client = build_admin_client(destination)?;
+    let source_partition_counts =
+        fetch_source_partition_counts(sources, transfer_topics, wait_for_broker)?;
 
     let mut plans = Vec::with_capacity(topics.len());
     let mut force_required = Vec::new();
 
     for (topic_index, topic) in topics.iter().enumerate() {
-        let desired_partitions = desired_partition_count(topic, &source_partition_counts)?;
-        let restore_fingerprint = if let Some(restore) = &topic.restore {
-            let reader = ArchiveReader::open(&restore.archive)?;
-            let archive_partitions = i32::try_from(reader.partitions().len())
-                .context("archive partition count does not fit Kafka")?;
-            if archive_partitions != desired_partitions {
-                bail!(
-                    "restore archive {} has {} partitions but destination topic {} configures {}",
-                    restore.archive.display(),
-                    archive_partitions,
-                    topic.name,
-                    desired_partitions
-                );
-            }
-            Some(archive::fingerprint(&restore.archive)?)
-        } else {
-            None
-        };
-
         let existing = destination_metadata
             .topics()
             .iter()
@@ -2441,6 +2744,64 @@ async fn reconcile_destination_topics(
                 error
             );
         }
+
+        if restore_policy == RestorePolicy::OnlyIfEmpty && existing.is_some() {
+            let populated = destination_topic_has_records(
+                metadata_consumer,
+                existing.context("existing destination metadata disappeared")?,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to determine whether destination topic {} is empty",
+                    topic.name
+                )
+            })?;
+            if populated {
+                plans.push(ReconcilePlan {
+                    topic_index,
+                    desired_partitions: 0,
+                    restore_fingerprint: None,
+                    action: ReconcileAction::None,
+                    skip_reason: Some("destination topic is populated".to_owned()),
+                });
+                continue;
+            }
+        }
+
+        let archive_inspection = topic
+            .restore
+            .as_ref()
+            .map(|restore| inspect_archive(&restore.archive))
+            .transpose()?;
+        let desired_partitions = if let Some(inspection) = &archive_inspection {
+            inspection.partition_count
+        } else {
+            desired_partition_count(topic, &source_partition_counts)?
+        };
+        let restore_fingerprint = archive_inspection
+            .as_ref()
+            .map(|inspection| inspection.fingerprint.clone());
+
+        if restore_policy != RestorePolicy::Normal {
+            let (action, skip_reason) = plan_special_restore_action(
+                restore_policy,
+                existing.is_some(),
+                archive_inspection
+                    .as_ref()
+                    .is_some_and(|inspection| inspection.has_records),
+            )
+            .context("missing special restore action")?;
+            plans.push(ReconcilePlan {
+                topic_index,
+                desired_partitions,
+                restore_fingerprint,
+                action,
+                skip_reason,
+            });
+            continue;
+        }
+
         let existing_topic_id = if existing.is_some() {
             let topic_id = kafka_identity::topic_id(metadata_consumer.client(), &topic.name)
                 .with_context(|| format!("failed to identify destination topic {}", topic.name))?;
@@ -2518,15 +2879,25 @@ async fn reconcile_destination_topics(
             .or(clone_state_mismatch);
         let action = plan_reconcile_action(existing.is_some(), reason);
         if let ReconcileAction::Recreate(reason) = &action {
-            if !recreation_authorized(force, topic.force) {
+            if restore_policy != RestorePolicy::OnlyIfEmpty
+                && !recreation_authorized(force, topic.force)
+            {
                 force_required.push(format!("{}: {reason}", topic.name));
             }
         }
+        let skip_reason = matches!(action, ReconcileAction::None).then(|| {
+            if topic.restore.is_some() {
+                "archive is already applied".to_owned()
+            } else {
+                "topic already matches its declaration".to_owned()
+            }
+        });
         plans.push(ReconcilePlan {
             topic_index,
             desired_partitions,
             restore_fingerprint,
             action,
+            skip_reason,
         });
     }
 
@@ -2542,8 +2913,9 @@ async fn reconcile_destination_topics(
         .filter(|plan| !matches!(plan.action, ReconcileAction::None))
         .map(|plan| topics[plan.topic_index].name.as_str())
         .collect();
-    let consumer_offset_resets = plan_consumer_offset_resets(&metadata_consumer, &fresh_topics)?;
+    let consumer_offset_resets = plan_consumer_offset_resets(metadata_consumer, &fresh_topics)?;
 
+    let mut reports = Vec::new();
     for plan in plans {
         let topic = &topics[plan.topic_index];
         let recreation_deadline = match plan.action {
@@ -2551,7 +2923,15 @@ async fn reconcile_destination_topics(
             ReconcileAction::None | ReconcileAction::Create => None,
         };
         match plan.action {
-            ReconcileAction::None => continue,
+            ReconcileAction::None => {
+                reports.push(TopicReport::Skipped {
+                    topic: topic.name.clone(),
+                    reason: plan
+                        .skip_reason
+                        .unwrap_or_else(|| "no changes required".to_owned()),
+                });
+                continue;
+            }
             ReconcileAction::Create => {
                 apply_consumer_offset_resets(
                     metadata_consumer.client(),
@@ -2569,7 +2949,7 @@ async fn reconcile_destination_topics(
                 clear_topic_state(runtime, &topic.name).await?;
                 delete_destination_topic(
                     &admin_client,
-                    &metadata_consumer,
+                    metadata_consumer,
                     &topic.name,
                     recreation_deadline.expect("recreation action has a deadline"),
                 )
@@ -2578,19 +2958,22 @@ async fn reconcile_destination_topics(
         }
         create_destination_topic(
             &admin_client,
-            &metadata_consumer,
+            metadata_consumer,
             topic,
             plan.desired_partitions,
             recreation_deadline,
         )
         .await?;
         wait_for_destination_topic_state(
-            &metadata_consumer,
+            metadata_consumer,
             &topic.name,
             Some(plan.desired_partitions),
             recreation_deadline.unwrap_or_else(|| Instant::now() + TOPIC_RECONCILIATION_TIMEOUT),
         )
         .await?;
+        reports.push(TopicReport::Created {
+            topic: topic.name.clone(),
+        });
 
         let topic_id = kafka_identity::topic_id(metadata_consumer.client(), &topic.name)
             .with_context(|| {
@@ -2664,10 +3047,14 @@ async fn reconcile_destination_topics(
             }
             runtime.state_dirty.store(true, Ordering::Release);
             flush_state(runtime, true).await?;
+            reports.push(TopicReport::Restored {
+                topic: topic.name.clone(),
+                archive: restore.archive.clone(),
+            });
         }
     }
 
-    Ok(())
+    Ok(reports)
 }
 
 fn plan_consumer_offset_resets(
@@ -2768,12 +3155,39 @@ struct ReconcilePlan {
     desired_partitions: i32,
     restore_fingerprint: Option<String>,
     action: ReconcileAction,
+    skip_reason: Option<String>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum ReconcileAction {
     None,
     Create,
     Recreate(String),
+}
+
+fn plan_special_restore_action(
+    policy: RestorePolicy,
+    existing: bool,
+    archive_has_records: bool,
+) -> Option<(ReconcileAction, Option<String>)> {
+    match (policy, existing, archive_has_records) {
+        (RestorePolicy::Normal, _, _) => None,
+        (_, false, _) => Some((ReconcileAction::Create, None)),
+        (RestorePolicy::OnlyIfEmpty, true, false) => Some((
+            ReconcileAction::None,
+            Some("destination topic and archive are empty".to_owned()),
+        )),
+        (RestorePolicy::OnlyIfEmpty, true, true) => Some((
+            ReconcileAction::Recreate(
+                "empty destination will receive a non-empty archive".to_owned(),
+            ),
+            None,
+        )),
+        (RestorePolicy::Reset, true, _) => Some((
+            ReconcileAction::Recreate("restore reset requested".to_owned()),
+            None,
+        )),
+    }
 }
 
 fn plan_reconcile_action(existing: bool, drift_reason: Option<String>) -> ReconcileAction {
@@ -3038,6 +3452,26 @@ async fn restore_archive(path: &Path, topic: &str, producer: &FutureProducer) ->
     reader.consumed_fingerprint()
 }
 
+fn inspect_archive(path: &Path) -> Result<ArchiveInspection> {
+    let mut reader = ArchiveReader::open(path)?;
+    let partition_count = i32::try_from(reader.partitions().len())
+        .context("archive partition count does not fit Kafka")?;
+    if partition_count == 0 {
+        bail!("archive {} contains no partitions", path.display());
+    }
+    let mut has_records = false;
+    while let Some(event) = reader.next_event()? {
+        if matches!(event, ArchiveEvent::Record(_)) {
+            has_records = true;
+        }
+    }
+    Ok(ArchiveInspection {
+        partition_count,
+        fingerprint: reader.consumed_fingerprint()?,
+        has_records,
+    })
+}
+
 async fn send_archive_record(
     producer: FutureProducer,
     topic: String,
@@ -3076,6 +3510,7 @@ async fn send_archive_record(
 fn fetch_source_partition_counts(
     sources: &HashMap<String, SourceKafkaConfig>,
     transfer_topics: &HashMap<String, Vec<TransferPlan>>,
+    wait_for_broker: Option<Duration>,
 ) -> Result<HashMap<String, i32>> {
     let mut counts = HashMap::new();
 
@@ -3087,9 +3522,8 @@ fn fetch_source_partition_counts(
             .get(source_name)
             .ok_or_else(|| anyhow!("missing source configuration for {source_name}"))?;
         let consumer = build_consumer(source_config)?;
-        let metadata = consumer
-            .fetch_metadata(None, Duration::from_secs(10))
-            .with_context(|| {
+        let metadata =
+            fetch_metadata_with_wait(&consumer, None, wait_for_broker).with_context(|| {
                 format!(
                     "failed to fetch source metadata for Kafka source {}",
                     source_name
@@ -3135,6 +3569,7 @@ fn fetch_source_partition_counts(
 fn fetch_clone_boundaries(
     sources: &HashMap<String, SourceKafkaConfig>,
     clone_topics: &HashMap<String, Vec<TransferPlan>>,
+    wait_for_broker: Option<Duration>,
 ) -> Result<CloneBoundaries> {
     let mut boundaries = HashMap::new();
     for (source_name, plans) in clone_topics {
@@ -3142,7 +3577,7 @@ fn fetch_clone_boundaries(
             .get(source_name)
             .ok_or_else(|| anyhow!("missing source configuration for {source_name}"))?;
         let consumer = build_consumer(source_config)?;
-        let metadata = fetch_metadata(&consumer, plans)?;
+        let metadata = fetch_metadata(&consumer, plans, wait_for_broker)?;
         for plan in plans {
             let topic = metadata
                 .topics()
@@ -3302,14 +3737,17 @@ fn apply_security_config(
     Ok(())
 }
 
-fn fetch_metadata(consumer: &StreamConsumer, plans: &[TransferPlan]) -> Result<Metadata> {
+fn fetch_metadata(
+    consumer: &StreamConsumer,
+    plans: &[TransferPlan],
+    wait_for_broker: Option<Duration>,
+) -> Result<Metadata> {
     let topic_names: Vec<&str> = plans
         .iter()
         .map(|plan| plan.source.topic.as_str())
         .collect();
 
-    consumer
-        .fetch_metadata(None, Duration::from_secs(10))
+    fetch_metadata_with_wait(consumer, None, wait_for_broker)
         .context("failed to fetch Kafka metadata")
         .and_then(|metadata| {
             for topic in &topic_names {
@@ -3395,6 +3833,8 @@ fn build_consumer_for_destination_metadata(
         .set("bootstrap.servers", &config.bootstrap_servers)
         .set("enable.auto.commit", "false")
         .set("enable.auto.offset.store", "false")
+        .set("enable.partition.eof", "true")
+        .set("auto.offset.reset", "error")
         .set("group.id", "fransson-destination-metadata");
 
     if let Some(client_id) = &config.client_id {
@@ -3551,6 +3991,65 @@ topics:
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "librdkafka mock cluster requires local sockets"]
+    async fn kafka_empty_probe_counts_tombstones_and_zero_length_records() {
+        let cluster = MockCluster::new(1).unwrap();
+        cluster.create_topic("empty", 2, 1).unwrap();
+        cluster.create_topic("tombstone", 1, 1).unwrap();
+        cluster.create_topic("zero", 1, 1).unwrap();
+        let bootstrap_servers = cluster.bootstrap_servers();
+        let destination = DestinationKafkaConfig {
+            bootstrap_servers: bootstrap_servers.clone(),
+            client_id: None,
+            security_protocol: None,
+            sasl: None,
+            properties: BTreeMap::new(),
+        };
+        let consumer = build_consumer_for_destination_metadata(&destination).unwrap();
+        let producer = mock_producer(&bootstrap_servers);
+
+        let metadata = consumer
+            .fetch_metadata(Some("empty"), Duration::from_secs(5))
+            .unwrap();
+        let topic = metadata
+            .topics()
+            .iter()
+            .find(|topic| topic.name() == "empty")
+            .unwrap();
+        assert!(!destination_topic_has_records(&consumer, topic)
+            .await
+            .unwrap());
+
+        let tombstone: FutureRecord<'_, [u8], [u8]> =
+            FutureRecord::to("tombstone").key(&b"deleted"[..]);
+        producer
+            .send(tombstone, Duration::from_secs(5))
+            .await
+            .unwrap();
+        producer
+            .send(
+                FutureRecord::to("zero").key(&b"key"[..]).payload(&b""[..]),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+
+        for topic_name in ["tombstone", "zero"] {
+            let metadata = consumer
+                .fetch_metadata(Some(topic_name), Duration::from_secs(5))
+                .unwrap();
+            let topic = metadata
+                .topics()
+                .iter()
+                .find(|topic| topic.name() == topic_name)
+                .unwrap();
+            assert!(destination_topic_has_records(&consumer, topic)
+                .await
+                .unwrap());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "librdkafka mock cluster requires local sockets"]
     async fn kafka_stream_assignment_skips_existing_records() {
         let cluster = MockCluster::new(1).unwrap();
         cluster.create_topic("source", 1, 1).unwrap();
@@ -3576,7 +4075,8 @@ topics:
             },
             kind: TransferKind::Stream,
         };
-        let metadata = fetch_metadata(consumer.as_ref(), std::slice::from_ref(&plan)).unwrap();
+        let metadata =
+            fetch_metadata(consumer.as_ref(), std::slice::from_ref(&plan), None).unwrap();
         let mut state = OffsetState::default();
         state.update_next_offset(
             "destination",
@@ -3796,8 +4296,41 @@ topics:
         let Command::Dump(args) = cli.command else {
             panic!("expected dump command");
         };
-        assert_eq!(args.archive, PathBuf::from("dump.fransson.zst"));
+        assert_eq!(args.archive, Some(PathBuf::from("dump.fransson.zst")));
         assert!(args.force);
+        assert_eq!(args.wait_for_broker, None);
+
+        let cli = Cli::try_parse_from([
+            "fransson",
+            "dump",
+            "--config",
+            "config.yaml",
+            "--all",
+            "--source-cluster",
+            "local",
+            "--wait-for-broker",
+            "60s",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command, Command::Dump(args)
+            if args.all
+                && args.source_cluster.as_deref() == Some("local")
+                && args.wait_for_broker == Some(Duration::from_secs(60))));
+
+        assert!(Cli::try_parse_from([
+            "fransson",
+            "dump",
+            "--config",
+            "config.yaml",
+            "--all",
+            "--source-cluster",
+            "local",
+            "--source",
+            "primary:source",
+            "--archive",
+            "dump.zst",
+        ])
+        .is_err());
 
         assert!(Cli::try_parse_from([
             "fransson",
@@ -3824,6 +4357,43 @@ topics:
         assert!(matches!(cli.command, Command::Restore(args)
             if args.force && args.state_dir == Path::new("/var/lib/fransson")));
 
+        assert!(Cli::try_parse_from(
+            ["fransson", "restore", "--config", "config.yaml", "--reset",]
+        )
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "fransson",
+            "restore",
+            "--config",
+            "config.yaml",
+            "--force",
+            "--reset",
+            "--only-if-empty",
+        ])
+        .is_err());
+        let cli = Cli::try_parse_from([
+            "fransson",
+            "restore",
+            "--config",
+            "config.yaml",
+            "--force",
+            "--reset",
+            "--wait-for-broker",
+            "2m",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command, Command::Restore(args)
+            if args.reset && args.wait_for_broker == Some(Duration::from_secs(120))));
+        assert!(Cli::try_parse_from([
+            "fransson",
+            "run",
+            "--config",
+            "config.yaml",
+            "--wait-for-broker",
+            "60s",
+        ])
+        .is_err());
+
         let cli = Cli::try_parse_from(["fransson", "state", "show"]).unwrap();
         assert!(matches!(cli.command, Command::State(StateArgs {
             command: StateCommand::Show(StateShowArgs { state_dir }),
@@ -3832,6 +4402,61 @@ topics:
         assert!(
             Cli::try_parse_from(["fransson", "state", "reset", "--config", "config.yaml"]).is_err()
         );
+    }
+
+    #[test]
+    fn dump_output_preflight_rejects_duplicates_and_existing_files() {
+        let directory = env::temp_dir().join(format!(
+            "fransson-dump-preflight-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(directory.join("nested")).unwrap();
+        let output = directory.join("dump.zst");
+        let duplicate = directory.join("nested/../dump.zst");
+        let jobs = vec![
+            DumpJob {
+                topic: "one".to_owned(),
+                archive: output.clone(),
+            },
+            DumpJob {
+                topic: "two".to_owned(),
+                archive: duplicate,
+            },
+        ];
+        assert!(preflight_dump_outputs(&jobs, false)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate dump archive paths"));
+
+        fs::write(&output, b"existing").unwrap();
+        assert!(preflight_dump_outputs(&jobs[..1], false)
+            .unwrap_err()
+            .to_string()
+            .contains("already exist"));
+        assert!(preflight_dump_outputs(&jobs[..1], true).is_ok());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn broker_wait_accepts_positive_human_durations_and_retries_only_connections() {
+        assert_eq!(
+            parse_positive_duration("1500ms").unwrap(),
+            Duration::from_millis(1500)
+        );
+        assert!(parse_positive_duration("0s").is_err());
+        assert!(is_transient_metadata_error(&KafkaError::MetadataFetch(
+            RDKafkaErrorCode::BrokerTransportFailure
+        )));
+        assert!(!is_transient_metadata_error(&KafkaError::MetadataFetch(
+            RDKafkaErrorCode::SaslAuthenticationFailed
+        )));
+        assert!(!is_transient_metadata_error(&KafkaError::MetadataFetch(
+            RDKafkaErrorCode::TopicAuthorizationFailed
+        )));
     }
 
     #[test]
@@ -4151,6 +4776,43 @@ topics:
     }
 
     #[test]
+    fn archive_inspection_distinguishes_empty_archives_from_records() {
+        let directory = env::temp_dir();
+        let empty = directory.join(format!("fransson-empty-{}.zst", std::process::id()));
+        let tombstone = directory.join(format!("fransson-tombstone-{}.zst", std::process::id()));
+
+        let mut writer = ArchiveWriter::create(&empty, &[0]).unwrap();
+        writer.begin_partition(0).unwrap();
+        writer.end_partition().unwrap();
+        writer.finish().unwrap();
+
+        let mut writer = ArchiveWriter::create(&tombstone, &[0]).unwrap();
+        writer.begin_partition(0).unwrap();
+        writer
+            .write_record(&ArchiveRecord {
+                timestamp: None,
+                key: Some(b"deleted".to_vec()),
+                payload: None,
+                headers: Vec::new(),
+            })
+            .unwrap();
+        writer.end_partition().unwrap();
+        writer.finish().unwrap();
+
+        let empty_inspection = inspect_archive(&empty).unwrap();
+        assert_eq!(empty_inspection.partition_count, 1);
+        assert!(!empty_inspection.has_records);
+        assert_eq!(
+            empty_inspection.fingerprint,
+            archive::fingerprint(&empty).unwrap()
+        );
+        assert!(inspect_archive(&tombstone).unwrap().has_records);
+
+        fs::remove_file(empty).unwrap();
+        fs::remove_file(tombstone).unwrap();
+    }
+
+    #[test]
     fn state_v3_uses_application_statuses_and_rejects_v2() {
         let marker = RestoreMarker {
             archive_sha256: "archive-hash".to_owned(),
@@ -4297,6 +4959,45 @@ topics:
         assert!(!recreation_authorized(false, false));
         assert!(recreation_authorized(true, false));
         assert!(recreation_authorized(false, true));
+    }
+
+    #[test]
+    fn special_restore_policies_create_skip_or_replace_as_declared() {
+        assert_eq!(
+            plan_special_restore_action(RestorePolicy::OnlyIfEmpty, false, false),
+            Some((ReconcileAction::Create, None))
+        );
+        assert!(matches!(
+            plan_special_restore_action(RestorePolicy::OnlyIfEmpty, true, false),
+            Some((ReconcileAction::None, Some(reason)))
+                if reason.contains("archive are empty")
+        ));
+        assert!(matches!(
+            plan_special_restore_action(RestorePolicy::OnlyIfEmpty, true, true),
+            Some((ReconcileAction::Recreate(reason), None))
+                if reason.contains("non-empty archive")
+        ));
+        assert!(matches!(
+            plan_special_restore_action(RestorePolicy::Reset, true, false),
+            Some((ReconcileAction::Recreate(reason), None)) if reason.contains("reset")
+        ));
+        assert_eq!(
+            plan_special_restore_action(RestorePolicy::Normal, true, true),
+            None
+        );
+
+        let restore_config: AppConfig =
+            serde_yaml::from_str(&app_config_yaml("    restore:\n      archive: dump.zst"))
+                .unwrap();
+        let restore_topics = resolve_topics(&restore_config, Path::new("config.yaml")).unwrap();
+        assert!(
+            validate_restore_policy_topics(&restore_topics, RestorePolicy::OnlyIfEmpty).is_ok()
+        );
+
+        let manage_config: AppConfig =
+            serde_yaml::from_str(&app_config_yaml("    manage:\n      partitions: 1")).unwrap();
+        let manage_topics = resolve_topics(&manage_config, Path::new("config.yaml")).unwrap();
+        assert!(validate_restore_policy_topics(&manage_topics, RestorePolicy::Reset).is_err());
     }
 
     #[test]
@@ -4568,6 +5269,7 @@ topics:
         for yaml in [
             include_str!("../examples/config.example.yaml"),
             include_str!("../examples/config.no-auth-dst.example.yaml"),
+            include_str!("../examples/restore-only.example.yaml"),
         ] {
             let config: AppConfig = serde_yaml::from_str(yaml).unwrap();
             validate_config(&config).unwrap();

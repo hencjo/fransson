@@ -1,0 +1,20 @@
+sources:
+  local:
+    bootstrap_servers: localhost:9092
+    group_id: fransson-local-dump
+
+destination:
+  bootstrap_servers: localhost:19092
+
+topics:
+  - name: products
+    config:
+      cleanup.policy: compact
+    restore:
+      archive: archives/products.fransson.zst
+
+  - name: stores
+    config:
+      cleanup.policy: compact
+    restore:
+      archive: archives/stores.fransson.zst

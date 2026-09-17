@@ -101,6 +101,44 @@ fransson restore --config fransson.yaml
 
 The archive contains no source topic name, so its destination name comes from the YAML. Equivalent partition contents produce byte-identical archives. `--force` on `dump` replaces an existing archive.
 
+To dump every configured restore topic from identically named topics on one source cluster:
+
+```bash
+fransson dump \
+  --config examples/restore-only.example.yaml \
+  --all \
+  --source-cluster local
+```
+
+Batch dump validates every output path before connecting. Each topic is still an independent snapshot and is published atomically; it is not a cross-topic transaction.
+
+## Conditional and forced restore
+
+Restore only destinations that are missing or proven empty:
+
+```bash
+fransson restore --config fransson.yaml --only-if-empty
+```
+
+Populated topics are skipped before drift and application markers are considered, even with `--force`. Fransson proves emptiness by consuming every partition through captured high-watermarks; tombstones and zero-length records count as data. A missing topic is created. An existing empty topic is left alone for an empty archive, while a non-empty archive authorizes recreation and reapplication without `--force`.
+
+Force every configured archive to be reapplied:
+
+```bash
+fransson restore --config fransson.yaml --reset --force
+```
+
+Both special restore modes require a restore-only configuration. Reset preflights every archive and destination before deleting topics or clearing state. Stop destination writers during either destructive workflow: emptiness is a bounded point-in-time observation, not a lock against later writes.
+
+When Kafka may still be starting, wait for each contacted cluster independently:
+
+```bash
+fransson dump --config fransson.yaml --source production:products --archive products.fransson.zst --wait-for-broker 60s
+fransson restore --config fransson.yaml --wait-for-broker 60s
+```
+
+Only transient metadata connection failures are retried. Configuration, authentication, and authorization failures still fail immediately.
+
 ## Stream new production events into test
 
 Configure a stream mapping:
@@ -176,7 +214,7 @@ Keep `fransson.yaml`, `.fransson/`, and archives on persistent writable storage.
 
 ## Configuration reference
 
-All commands use the same strict YAML schema. Unknown fields, obsolete names, conflicting modes, and invalid combinations fail loudly. See [`config.example.yaml`](examples/config.example.yaml) for the complete authenticated example and [`config.no-auth-dst.example.yaml`](examples/config.no-auth-dst.example.yaml) for a destination without authentication.
+All commands use the same strict YAML schema. Unknown fields, obsolete names, conflicting modes, and invalid combinations fail loudly. See [`config.example.yaml`](examples/config.example.yaml) for the complete authenticated example, [`config.no-auth-dst.example.yaml`](examples/config.no-auth-dst.example.yaml) for a destination without authentication, and [`restore-only.example.yaml`](examples/restore-only.example.yaml) for batch dump and special restore modes.
 
 ```yaml
 sources:
@@ -264,6 +302,8 @@ An `empty` topic is reset once during every `restore` invocation and every `run`
 
 Application writes after an applied restore do not count as drift and do not trigger another restore. If a restore fails partway through, its applied marker is absent; the next reconciliation requires force before recreating the partial destination and trying again.
 
+`restore --reset --force` deliberately ignores applied markers and replaces every existing restore topic. `restore --only-if-empty` instead treats destination contents as the gate: populated topics are skipped, while empty topics receive non-empty archives through an automatically authorized recreation.
+
 Clone checkpoints must remain between the source partition's current low and high watermarks. If source retention removes an unprocessed checkpoint, Fransson fails closed and requires force to rebuild the destination from the source records that remain; it never jumps silently to the source end.
 
 ## State, archives, and delivery
@@ -284,17 +324,20 @@ Clone checkpoints must remain between the source partition's current low and hig
 ## Command reference
 
 ```text
-fransson dump --config FILE --source SOURCE:TOPIC --archive FILE [--force]
-fransson restore --config FILE [--state-dir DIR] [--force]
+fransson dump --config FILE --source SOURCE:TOPIC --archive FILE [--force] [--wait-for-broker DURATION]
+fransson dump --config FILE --all --source-cluster SOURCE [--force] [--wait-for-broker DURATION]
+fransson restore --config FILE [--state-dir DIR] [--force] [--only-if-empty] [--wait-for-broker DURATION]
+fransson restore --config FILE [--state-dir DIR] --reset --force [--wait-for-broker DURATION]
 fransson run --config FILE [--state-dir DIR] [--force]
 fransson state show [--state-dir DIR]
 fransson state reset --config FILE (--topic TOPIC | --all) [--state-dir DIR]
 ```
 
-- `dump` creates one deterministic compressed archive and never connects to the destination.
+- `dump` creates deterministic compressed archives and never connects to the destination. Both dump forms accept `--wait-for-broker DURATION`.
 - `restore` performs one bounded reconciliation, restore, and clone pass; streams remain inactive.
 - `run` reconciles first, then continuously clones and forwards stream records until stopped.
 - `restore --force` and `run --force` authorize every required destination topic recreation for that invocation.
+- Successful restore output reports skipped, created, and restored topics without printing record contents.
 
 Use `fransson <command> --help` for the complete option reference.
 

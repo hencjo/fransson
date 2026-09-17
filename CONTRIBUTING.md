@@ -23,6 +23,19 @@ FRANSSON_TEST_KAFKA_BOOTSTRAP_SERVERS=localhost:9092 \
   cargo test kafka_reconciliation_ -- --ignored --nocapture
 ```
 
+The ignored librdkafka mock-cluster tests cover deterministic dump/restore, bounded emptiness probing, stream startup, and outage recovery. They require permission to open local sockets:
+
+```bash
+for test in \
+  kafka_dump_restore_dump_is_byte_identical \
+  kafka_empty_probe_counts_tombstones_and_zero_length_records \
+  kafka_stream_assignment_skips_existing_records \
+  kafka_stream_producer_waits_through_destination_outage
+do
+  cargo test "$test" -- --ignored --nocapture
+done
+```
+
 Keep `README.md`, this guide, and the files under `examples/` accurate when changing public behavior.
 
 ## Commits and versions
