@@ -2,13 +2,14 @@ sources:
   primary:
     bootstrap_servers: localhost:9092
     client_id: fransson-primary
-    group_id: fransson-primary
+    # Export any caller-chosen variable names before running Fransson.
+    group_id: "fransson-${USER}"
     max_in_flight_per_partition: 64
     security_protocol: SASL_SSL
     sasl:
       mechanism: PLAIN
-      username: source-user
-      password_env: PRIMARY_KAFKA_PASSWORD
+      username: "${SOURCE_KAFKA_USER}"
+      password: "${PRIMARY_KAFKA_PASSWORD}"
     properties:
       fetch.wait.max.ms: "50"
 
@@ -19,7 +20,7 @@ destination:
   sasl:
     mechanism: PLAIN
     username: destination-user
-    password_env: DESTINATION_KAFKA_PASSWORD
+    password: "${DESTINATION_KAFKA_PASSWORD}"
 
 topics:
   # Clone a compacted topic from its earliest offset and persist progress.

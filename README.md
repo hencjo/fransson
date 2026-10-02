@@ -71,7 +71,7 @@ sources:
     sasl:
       mechanism: PLAIN
       username: developer
-      password_env: PRODUCTION_KAFKA_PASSWORD
+      password: "${PRODUCTION_KAFKA_PASSWORD}"
 
 destination:
   bootstrap_servers: localhost:9092
@@ -152,7 +152,7 @@ sources:
     sasl:
       mechanism: PLAIN
       username: developer
-      password_env: PRODUCTION_KAFKA_PASSWORD
+      password: "${PRODUCTION_KAFKA_PASSWORD}"
 
 destination:
   bootstrap_servers: test-kafka.example.com:9092
@@ -227,7 +227,7 @@ sources:
     sasl:
       mechanism: PLAIN
       username: source-user
-      password_env: PRIMARY_KAFKA_PASSWORD
+      password: "${PRIMARY_KAFKA_PASSWORD}"
     properties:
       fetch.wait.max.ms: "50"
 
@@ -268,10 +268,37 @@ topics:
       partitions: 3
 ```
 
+### Environment interpolation
+
+String values accept `${NAME}` using any environment variable inherited by Fransson;
+there are no prescribed names. For example:
+
+```yaml
+group_id: "fransson-${USER}"
+sasl:
+  mechanism: PLAIN
+  username: "${KAFKA_USER}"
+  password: "${KAFKA_PASSWORD}"
+```
+
+Export the referenced variables before running Fransson. Interpolation happens once
+when loading the config, including values in unused connections. Missing or
+non-Unicode variables fail with their name and config location. Empty values are
+allowed only where the field's validation permits them; SASL fields must be nonblank.
+
+- Names match `[A-Za-z_][A-Za-z0-9_]*`; multiple references and surrounding text are supported.
+- `$$` produces a literal `$`, so `$${NAME}` produces literal `${NAME}`. Bare `$NAME` stays unchanged.
+- Only string values expand, including archive paths and Kafka property values. Mapping keys do not expand; numbers and booleans cannot be parameterized this way.
+- YAML is parsed first: quotes, newlines, or YAML-looking environment contents remain data, not config structure. Expanded archive paths still resolve relative to the config file.
+- No recursive expansion, shell commands, default expressions such as `${NAME:-default}`, or automatic `.env` loading. Malformed or unsupported `${...}` expressions fail.
+
+**Migration:** `password_env: NAME` is no longer accepted. Replace it with
+`password: "${NAME}"` for both source and destination SASL configurations.
+
 ### Connections
 
 - Every source needs `bootstrap_servers` and an explicit `group_id`. Fransson manually assigns partitions and never commits consumer offsets, but Kafka still checks group authorization.
-- `client_id`, `security_protocol`, and `sasl` are optional. `password_env` names the environment variable holding the SASL password.
+- `client_id`, `security_protocol`, and `sasl` are optional. `sasl.password` holds the password; use `${YOUR_VARIABLE}` to read it from the environment.
 - `properties` passes advanced librdkafka settings through. It cannot override typed fields or Fransson's reliability settings, including `auto.offset.reset=error` for clone checkpoints.
 - `max_in_flight_per_partition` defaults to `64`.
 - Destination brokers are contacted only by `restore` and `run`; `dump` opens only its selected source.

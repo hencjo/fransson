@@ -29,6 +29,7 @@ use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 
 mod archive;
+mod config_env;
 mod kafka_consumer_groups;
 mod kafka_identity;
 
@@ -208,12 +209,23 @@ struct DestinationKafkaConfig {
     properties: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SaslConfig {
     mechanism: String,
     username: String,
-    password_env: String,
+    password: String,
+}
+
+impl fmt::Debug for SaslConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SaslConfig")
+            .field("mechanism", &self.mechanism)
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1574,8 +1586,8 @@ fn ensure_identity(label: &str, expected: &str, actual: &str) -> Result<()> {
 fn load_config(path: &Path) -> Result<AppConfig> {
     let bytes =
         fs::read(path).with_context(|| format!("failed to read config file {}", path.display()))?;
-    let config = serde_yaml::from_slice(&bytes)
-        .with_context(|| format!("failed to parse YAML config {}", path.display()))?;
+    let config = config_env::decode(&bytes, |name| env::var(name))
+        .with_context(|| format!("failed to load config {}", path.display()))?;
     Ok(config)
 }
 
@@ -1801,7 +1813,7 @@ fn validate_sasl(sasl: Option<&SaslConfig>, scope: &str) -> Result<()> {
     if let Some(sasl) = sasl {
         require_nonblank(&sasl.mechanism, &format!("{scope} sasl.mechanism"))?;
         require_nonblank(&sasl.username, &format!("{scope} sasl.username"))?;
-        require_nonblank(&sasl.password_env, &format!("{scope} sasl.password_env"))?;
+        require_nonblank(&sasl.password, &format!("{scope} sasl.password"))?;
     }
     Ok(())
 }
@@ -3722,16 +3734,10 @@ fn apply_security_config(
     }
 
     if let Some(sasl) = sasl {
-        let password = env::var(&sasl.password_env).with_context(|| {
-            format!(
-                "failed to read SASL password from environment variable {}",
-                sasl.password_env
-            )
-        })?;
         client
             .set("sasl.mechanism", &sasl.mechanism)
             .set("sasl.username", &sasl.username)
-            .set("sasl.password", password);
+            .set("sasl.password", &sasl.password);
     }
 
     Ok(())
@@ -5265,13 +5271,82 @@ topics:
     }
 
     #[test]
+    fn interpolated_connections_paths_and_passwords() {
+        let yaml = r#"
+sources:
+  primary:
+    bootstrap_servers: "${BROKERS}"
+    group_id: "group-${USER}"
+    sasl:
+      mechanism: PLAIN
+      username: "${USER}"
+      password: "${PASSWORD}"
+    properties:
+      fetch.wait.max.ms: "${WAIT}"
+topics:
+  - name: restored
+    restore:
+      archive: "${ARCHIVE}/data.zst"
+"#;
+        let config: AppConfig = config_env::decode(yaml.as_bytes(), |name| {
+            Ok(match name {
+                "BROKERS" => "localhost:9092",
+                "USER" => "alice",
+                "PASSWORD" => "secret-\"\n${LITERAL}",
+                "WAIT" => "50",
+                "ARCHIVE" => "archives",
+                _ => panic!("unexpected variable"),
+            }
+            .into())
+        })
+        .unwrap();
+        let source = &config.sources["primary"];
+        assert_eq!(source.bootstrap_servers, "localhost:9092");
+        assert_eq!(source.group_id, "group-alice");
+        assert_eq!(source.properties["fetch.wait.max.ms"], "50");
+        let sasl = source.sasl.as_ref().unwrap();
+        assert_eq!(sasl.username, "alice");
+        validate_sasl(Some(sasl), "source").unwrap();
+        let mut client = ClientConfig::new();
+        apply_security_config(&mut client, &None, Some(sasl)).unwrap();
+        assert_eq!(client.get("sasl.password"), Some("secret-\"\n${LITERAL}"));
+        assert!(!format!("{config:?}").contains("secret-"));
+        assert_eq!(
+            resolve_config_path(
+                Path::new("config/fransson.yaml"),
+                &config.topics[0].restore.as_ref().unwrap().archive
+            ),
+            PathBuf::from("config/archives/data.zst")
+        );
+    }
+
+    #[test]
+    fn sasl_rejects_legacy_missing_and_blank_passwords() {
+        for fields in [
+            "password_env: OLD",
+            "password: secret\npassword_env: OLD",
+            "",
+        ] {
+            let yaml = format!("mechanism: PLAIN\nusername: user\n{fields}");
+            assert!(config_env::decode::<SaslConfig>(yaml.as_bytes(), |_| unreachable!()).is_err());
+        }
+        let sasl: SaslConfig = config_env::decode(
+            b"mechanism: PLAIN\nusername: user\npassword: '${EMPTY}'",
+            |_| Ok(String::new()),
+        )
+        .unwrap();
+        assert!(validate_sasl(Some(&sasl), "source").is_err());
+    }
+
+    #[test]
     fn published_examples_match_the_strict_schema() {
         for yaml in [
             include_str!("../examples/config.example.yaml"),
             include_str!("../examples/config.no-auth-dst.example.yaml"),
             include_str!("../examples/restore-only.example.yaml"),
         ] {
-            let config: AppConfig = serde_yaml::from_str(yaml).unwrap();
+            let config: AppConfig =
+                config_env::decode(yaml.as_bytes(), |_| Ok("example-value".into())).unwrap();
             validate_config(&config).unwrap();
             resolve_topics(&config, Path::new("config.yaml")).unwrap();
         }

@@ -7,7 +7,7 @@ sources:
     sasl:
       mechanism: PLAIN
       username: source-user
-      password_env: PRIMARY_KAFKA_PASSWORD
+      password: "${PRIMARY_KAFKA_PASSWORD}"
 
 destination:
   bootstrap_servers: localhost:9093

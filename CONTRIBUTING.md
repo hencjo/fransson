@@ -38,6 +38,15 @@ done
 
 Keep `README.md`, this guide, and the files under `examples/` accurate when changing public behavior.
 
+## Config interpolation tests
+
+Keep environment expansion tests deterministic by injecting a lookup into
+`config_env::decode`, rather than mutating the process environment. Cover literal
+dollars, missing variables, single-pass expansion, YAML injection resistance,
+string-only typing, and secret-safe errors. Published examples must pass through
+the same decoding pipeline using fixture environment values. SASL uses `password`,
+not the removed `password_env` field; never include resolved passwords in diagnostics.
+
 ## Commits and changelog
 
 Use Conventional Commit summaries (`fix:`, `feat:`, `docs:`, `ci:`, and `feat!:`).
