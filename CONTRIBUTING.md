@@ -86,6 +86,10 @@ Do not manually bump Cargo versions or rewrite published changelog entries.
 Fransson is not published to crates.io. Release artifacts remain the GNU/Linux
 archive and SHA-256 checksum, including README, LICENSE, and `examples/`.
 
+The Ubuntu build runner needs `libcurl4-openssl-dev` as well as the SASL and zlib
+development packages: the bundled librdkafka includes curl headers even with its
+curl feature disabled. This is a build prerequisite, not a new runtime dependency.
+
 Enter `nix develop` for Bash, awk, Rust, and cargo-release, then:
 
 ```bash
@@ -145,6 +149,9 @@ The script never resets your work or moves tags after a failure. Inspect
   workflow or manually run **Release artifacts**, supplying the existing tag.
   Reruns reuse the release and replace its same-named assets; partial drafts are
   completed. Historical tags predating this tooling need their original workflow.
+  For a workflow-only fix, commit it to `master`, then dispatch **Release artifacts**
+  from `master` with the existing release tag. The updated workflow still checks
+  out and builds the exact tagged source; do not move the tag to the CI fix.
 
 ### Release tooling tests
 

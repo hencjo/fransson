@@ -61,7 +61,7 @@ jobs:
       - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes build-essential cmake libsasl2-dev pkg-config zlib1g-dev
+          sudo apt-get install --yes build-essential cmake libcurl4-openssl-dev libsasl2-dev pkg-config zlib1g-dev
 
       - name: Build release binary
         run: cargo build --release --locked

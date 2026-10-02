@@ -57,6 +57,8 @@ sudo apt-get install libsasl2-2 libsasl2-modules zlib1g
 GSSAPI/Kerberos users also need their distro's Cyrus SASL GSSAPI module, such as `libsasl2-modules-gssapi-mit` on Ubuntu.
 
 Use Nix when you want Fransson and all runtime dependencies managed together.
+Native release-build prerequisites and rebuild instructions are documented in
+[`CONTRIBUTING.md`](CONTRIBUTING.md#releases).
 
 ## Dump production data and restore it locally
 

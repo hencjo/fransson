@@ -15,6 +15,10 @@ populated Unreleased categories, not commit summaries.
 
 ### Fixed
 
+The GitHub release runner now installs curl development headers required by the
+bundled librdkafka. Existing tags can be rebuilt with the corrected workflow;
+archive runtime dependencies and example configurations are unchanged.
+
 ### Security
 
 ### Documentation
