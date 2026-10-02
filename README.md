@@ -355,4 +355,8 @@ cargo test
 nix flake check
 ```
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for commit conventions and the release process. Releases are generated through release-plz; do not manually bump the Cargo version or changelog.
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for commit conventions and the release process.
+Write user-facing changes and upgrade instructions in [`CHANGELOG.md`](CHANGELOG.md).
+Preview a release with `./scripts/release`; use `./scripts/release --execute` to
+stamp versions, commit, tag, and push. GitHub builds and publishes the release
+archive from that tag. Do not manually bump Cargo versions.

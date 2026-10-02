@@ -1,27 +1,23 @@
 name: Release artifacts
 
 on:
-  release:
-    types:
-      - published
-  workflow_run:
-    workflows:
-      - Release-plz
-    types:
-      - completed
-    branches:
-      - master
+  push:
+    tags:
+      - 'fransson-v*'
   workflow_dispatch:
     inputs:
       tag:
-        description: Git tag for an existing GitHub release
+        description: Existing fransson-v<version> tag to build or rebuild
         required: true
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
   linux-x86_64:
     name: Build Linux x86_64 GNU
     runs-on: ubuntu-22.04
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     permissions:
       contents: write
     env:
@@ -31,62 +27,25 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.release.tag_name || github.event.inputs.tag || github.event.workflow_run.head_sha || github.sha }}
+          ref: refs/tags/${{ github.event.inputs.tag || github.ref_name }}
           persist-credentials: false
 
       - name: Resolve release artifact
         id: release
         shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
-          EVENT_TAG: ${{ github.event.release.tag_name }}
-          INPUT_TAG: ${{ github.event.inputs.tag }}
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
 
-          tag="${EVENT_TAG:-}"
-          if [[ -z "${tag}" ]]; then
-            tag="${INPUT_TAG:-}"
-          fi
-          manifest_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
-
-          if [[ -z "${tag}" ]]; then
-            version="${manifest_version}"
-            tag="${BIN}-v${version}"
-          else
-            version="${tag#"$BIN"-v}"
-          fi
-
-          if [[ "${tag}" != "${BIN}-v${version}" || -z "${version}" ]]; then
-            echo "Expected tag ${BIN}-v<version>, got ${tag}." >&2
-            exit 1
-          fi
-          if [[ "${version}" != "${manifest_version}" ]]; then
-            echo "Tag version ${version} does not match Cargo.toml version ${manifest_version}." >&2
-            exit 1
-          fi
+          tag="${RELEASE_TAG}"
+          ./scripts/release --verify-tag "${tag}"
+          version="${tag#fransson-v}"
+          ./scripts/release --notes "${version}" > "${RUNNER_TEMP}/release-notes.md"
 
           package="${BIN}-${version}-${PACKAGE_PLATFORM}"
           archive="${package}.tar.gz"
           checksum="${archive}.sha256"
-
-          if ! gh release view "${tag}" >/dev/null 2>&1; then
-            if [[ "${GITHUB_EVENT_NAME}" == "workflow_run" ]]; then
-              echo "No GitHub release ${tag}; skipping artifact build."
-              echo "skip=true" >> "${GITHUB_OUTPUT}"
-              exit 0
-            fi
-            echo "GitHub release ${tag} does not exist." >&2
-            exit 1
-          fi
-
-          if [[ "${GITHUB_EVENT_NAME}" == "workflow_run" ]] && \
-            gh release view "${tag}" --json assets --jq '.assets[].name' | grep -Fxq "${archive}" && \
-            gh release view "${tag}" --json assets --jq '.assets[].name' | grep -Fxq "${checksum}"; then
-            echo "Release ${tag} already has ${archive} and ${checksum}; skipping."
-            echo "skip=true" >> "${GITHUB_OUTPUT}"
-            exit 0
-          fi
 
           {
             echo "tag=${tag}"
@@ -94,25 +53,20 @@ jobs:
             echo "package=${package}"
             echo "archive=${archive}"
             echo "checksum=${checksum}"
-            echo "skip=false"
           } >> "${GITHUB_OUTPUT}"
 
       - name: Install Rust toolchain
-        if: steps.release.outputs.skip != 'true'
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install native build dependencies
-        if: steps.release.outputs.skip != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install --yes build-essential cmake libsasl2-dev pkg-config zlib1g-dev
 
       - name: Build release binary
-        if: steps.release.outputs.skip != 'true'
         run: cargo build --release --locked
 
       - name: Verify dynamic dependencies
-        if: steps.release.outputs.skip != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -135,7 +89,6 @@ jobs:
           fi
 
       - name: Package artifact
-        if: steps.release.outputs.skip != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -154,7 +107,6 @@ jobs:
           (cd dist && sha256sum "${{ steps.release.outputs.archive }}" > "${{ steps.release.outputs.checksum }}")
 
       - name: Smoke-test packaged binary
-        if: steps.release.outputs.skip != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -165,7 +117,6 @@ jobs:
             bash -ec 'apt-get update >/dev/null && apt-get install --yes libsasl2-2 libsasl2-modules zlib1g >/dev/null && /artifact/fransson --version'
 
       - name: Upload workflow artifact
-        if: steps.release.outputs.skip != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.release.outputs.archive }}
@@ -173,12 +124,21 @@ jobs:
             dist/${{ steps.release.outputs.archive }}
             dist/${{ steps.release.outputs.checksum }}
 
-      - name: Upload release artifact
-        if: steps.release.outputs.skip != 'true'
+      - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          ARCHIVE: ${{ steps.release.outputs.archive }}
+          CHECKSUM: ${{ steps.release.outputs.checksum }}
         run: |
-          gh release upload "${{ steps.release.outputs.tag }}" \
-            "dist/${{ steps.release.outputs.archive }}" \
-            "dist/${{ steps.release.outputs.checksum }}" \
-            --clobber
+          set -euo pipefail
+          # List through the API so authorization/network failures are not mistaken
+          # for an absent release. Pagination also finds older releases on rebuild.
+          tags="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --jq '.[].tag_name')"
+          if ! grep -Fxq "${RELEASE_TAG}" <<< "${tags}"; then
+            gh release create "${RELEASE_TAG}" --verify-tag --draft \
+              --title "${RELEASE_TAG}" --notes-file "${RUNNER_TEMP}/release-notes.md"
+          fi
+          gh release upload "${RELEASE_TAG}" "dist/${ARCHIVE}" "dist/${CHECKSUM}" --clobber
+          gh release edit "${RELEASE_TAG}" --draft=false \
+            --notes-file "${RUNNER_TEMP}/release-notes.md"

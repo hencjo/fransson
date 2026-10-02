@@ -1,0 +1,26 @@
+name: Release tooling tests
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  release-tooling:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-release
+        run: cargo install cargo-release --version 1.1.1 --locked
+      - name: Check shell scripts
+        run: shellcheck scripts/release scripts/tests/release.sh
+      - name: Test release lifecycle against temporary repositories
+        env:
+          RELEASE_TEST_REAL: '1'
+        run: ./scripts/tests/release.sh

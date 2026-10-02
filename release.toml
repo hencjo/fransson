@@ -1,0 +1,9 @@
+allow-branch = ["master"]
+publish = false
+push = true
+push-remote = "origin"
+# cargo-release pushes the branch and release tag atomically by default.
+tag-name = "fransson-v{{version}}"
+tag-message = "chore: release {{version}}"
+pre-release-commit-message = "chore: release {{version}}"
+pre-release-hook = ["bash", "scripts/release", "--stamp"]

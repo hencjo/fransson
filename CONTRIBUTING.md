@@ -38,38 +38,112 @@ done
 
 Keep `README.md`, this guide, and the files under `examples/` accurate when changing public behavior.
 
-## Commits and versions
+## Commits and changelog
 
-Use Conventional Commit summaries so release-plz can choose the version and write a useful changelog:
+Use Conventional Commit summaries (`fix:`, `feat:`, `docs:`, `ci:`, and `feat!:`).
+Commit messages do not determine release versions or generate release notes.
+Write user-facing changes directly under `## [Unreleased]` in `CHANGELOG.md`.
+Explain what changed, who is affected, and how to upgrade; include before/after
+configuration or CLI examples when useful. Keep the published example configs
+under `examples/` accurate as part of the same change.
 
-```text
-fix: handle missing restore state
-feat: add topic reset mode
-docs: clarify archive behavior
-ci: publish GNU/Linux release artifact
-feat!: change the YAML topic schema
-```
+Use these exact level-three category headings; empty headings and HTML comments
+are placeholders and do not affect the version:
 
-Do not manually bump `Cargo.toml` or edit generated release entries in `CHANGELOG.md`. Breaking changes use `!` or a `BREAKING CHANGE:` footer.
+| Category | Automatic bump |
+| --- | --- |
+| Breaking changes | Minor on 0.x; major on 1.x and later |
+| Added, Changed | Minor |
+| Fixed, Security, Documentation | Patch |
+| Upgrade notes | None; accompanies another populated category |
+
+The highest populated category wins. Put incompatible changes under **Breaking
+changes**, not merely Changed. Nested headings (level four or deeper), paragraphs,
+lists, and fenced code examples are supported. Unknown or duplicate categories,
+unclosed fences/comments, and empty releases are rejected. A documentation-only
+release bumps patch. Use `--version 1.0.0` deliberately when ready for 1.0;
+explicit versions must be at least the inferred version. Prereleases are not
+supported by this workflow.
+
+Release stamping replaces `{{version}}` and `{{date}}` in the current Unreleased
+body (including code examples), dates the release heading in UTC, and inserts a
+fresh empty Unreleased skeleton. Do not use these exact placeholders when you
+intend literal text. Existing historical sections are left untouched.
 
 ## Releases
 
-`Cargo.toml` is the version source of truth; `flake.nix` reads it directly. Fransson is not published to crates.io.
+`Cargo.toml` is the build version source of truth; `flake.nix` reads it directly.
+Do not manually bump Cargo versions or rewrite published changelog entries.
+Fransson is not published to crates.io. Release artifacts remain the GNU/Linux
+archive and SHA-256 checksum, including README, LICENSE, and `examples/`.
 
-Pushing normal work to `master` opens or updates a release PR. A release is published only after that PR is merged:
+Enter `nix develop` for Bash, awk, Rust, and cargo-release, then:
 
-1. Review the version and changelog in the release PR.
-2. Merge the release PR.
-3. release-plz creates `fransson-v<version>` and the matching GitHub release.
-4. The artifact workflow attaches the GNU/Linux tarball and checksum.
+```bash
+./scripts/tests/release.sh
+./scripts/release                    # read-only preview; also works on dirty work
+./scripts/release --version 1.0.0     # optional deliberate version override
+```
 
-To rebuild artifacts for an existing release, manually run **Release artifacts** with its tag.
+Run the development checks above, review the changelog, and commit and push normal
+work first. Execution requires a completely clean `master` tracking
+`origin/master`, with no local-only or remote-only commits:
 
-### One-time GitHub setup
+```bash
+./scripts/release --execute
+# Or, when intentionally graduating to 1.0:
+./scripts/release --execute --version 1.0.0
+```
 
-Under **Settings → Actions → General**:
+The script fetches origin, validates the state and version, and asks cargo-release
+to update Cargo.toml/Cargo.lock, stamp the changelog through a Bash hook, commit
+`chore: release <version>`, and create `fransson-v<version>`. It atomically pushes
+the commit and tag to origin. Repository configuration is isolated from personal
+cargo-release settings. Never invoke the internal `--stamp` hook manually.
 
-1. Set workflow permissions to **Read and write permissions**.
-2. Enable **Allow GitHub Actions to create and approve pull requests**.
+The tag triggers **Release artifacts** on GitHub. It validates the tag, manifest,
+and changelog, builds and smoke-tests the archive, uploads assets to a draft, and
+publishes the release using that version's changelog section. A failed build does
+not publish a new release. No release PR, crates.io token, or PAT is needed;
+the workflow requests `contents: write` for its GitHub token. Your local Git
+credentials must be allowed to push `master` and release tags; branch protection
+must permit this maintainer-driven flow.
 
-No crates.io token is required.
+The wrapper uses cargo-release's explicit version, hook, commit, tag, and push
+steps, avoiding the all-in-one command's unnecessary crates.io ownership lookup.
+Cargo may still need network access for normal dependency metadata resolution.
+
+### Recovery and rebuilding
+
+The script never resets your work or moves tags after a failure. Inspect
+`git status`, `git log -3`, `git tag --list 'fransson-v*'`, and
+`git ls-remote --tags origin` before retrying.
+
+- **Before a release commit/tag exists:** inspect any partially stamped files.
+  Restore only the release-generated edits after review, fix the cause, and run
+  the script again. Execution began from a clean tree, but do not discard any work
+  you have done since the failure.
+- **Release commit and tag exist locally, but the push failed:** do not run the
+  release script again (Unreleased is now empty). Verify the tag points to the
+  release commit and run `./scripts/release --verify-tag fransson-v<VERSION>`.
+  Retry `git push --atomic origin HEAD:refs/heads/master refs/tags/fransson-v<VERSION>`.
+  Never force-push; if master has advanced, resolve the situation explicitly.
+- **Release commit exists but tag creation failed:** fix the cause, check the
+  manifest and `./scripts/release --notes <VERSION>`, then retry only the tag step:
+  `cargo release tag --isolated --config release.toml --execute`.
+  Validate and push the resulting tag as described above; do not bump again.
+- **Tag already reached GitHub:** never move or recreate it. Rerun the failed
+  workflow or manually run **Release artifacts**, supplying the existing tag.
+  Reruns reuse the release and replace its same-named assets; partial drafts are
+  completed. Historical tags predating this tooling need their original workflow.
+
+### Release tooling tests
+
+`./scripts/tests/release.sh` runs parser and shell tests using temporary Git
+repositories and a fake cargo-release command. It never pushes to the real
+repository. Set `RELEASE_TEST_REAL=1` to additionally exercise the installed
+cargo-release against a dependency-free Rust fixture and a temporary bare remote:
+
+```bash
+RELEASE_TEST_REAL=1 ./scripts/tests/release.sh
+```

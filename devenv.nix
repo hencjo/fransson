@@ -8,7 +8,10 @@
 
 {
   packages = with pkgs; [
+    bash
+    gawk
     git
+    cargo-release
     cyrus_sasl
     curl.dev
     cmake

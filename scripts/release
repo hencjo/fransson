@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd "$script_dir/.."
+fail() { printf 'release: %s\n' "$*" >&2; exit 1; }
+stable_version() { [[ $1 =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; }
+manifest_version() {
+    awk '/^\[package\]$/ { package=1; next } /^\[/ { package=0 }
+        package && /^version = "/ { gsub(/"/, "", $3); print $3 }' Cargo.toml
+}
+changelog() { awk -v mode="$1" -v version="${2:-}" -v date="${3:-}" -f "$script_dir/changelog.awk" CHANGELOG.md; }
+
+# Internal hook used by cargo-release, and read-only helpers used by CI.
+case "${1:-}" in
+    --stamp)
+        [[ $# == 1 && ${DRY_RUN:-} =~ ^(true|false)$ ]] || fail '--stamp is a cargo-release hook'
+        stable_version "${NEW_VERSION:-}" || fail 'hook requires a stable NEW_VERSION'
+        [[ $(manifest_version) == "$NEW_VERSION" ]] || fail 'hook version differs from Cargo.toml'
+        if [[ $DRY_RUN == true ]]; then
+            changelog stamp "$NEW_VERSION" "$(date -u +%F)" >/dev/null
+            exit 0
+        fi
+        tmp="$(mktemp ./CHANGELOG.md.XXXXXX)"
+        trap 'rm -f "$tmp"' EXIT
+        cp -p CHANGELOG.md "$tmp"
+        changelog stamp "$NEW_VERSION" "$(date -u +%F)" >"$tmp"
+        # Preserve permissions and atomically replace after successful validation.
+        mv "$tmp" CHANGELOG.md
+        exit 0
+        ;;
+    --notes)
+        [[ $# == 2 ]] || fail 'usage: scripts/release --notes VERSION'
+        stable_version "$2" || fail 'notes require a stable version'
+        changelog notes "$2"
+        exit 0
+        ;;
+    --verify-tag)
+        [[ $# == 2 && $2 == fransson-v* ]] || fail 'expected fransson-v<version>'
+        version=${2#fransson-v}
+        stable_version "$version" || fail 'tag must contain a stable version'
+        [[ $(manifest_version) == "$version" ]] || fail 'tag version differs from Cargo.toml'
+        [[ $(git rev-parse HEAD) == "$(git rev-parse "refs/tags/$2^{commit}")" ]] || fail 'checkout differs from tag'
+        changelog notes "$version" >/dev/null
+        exit 0
+        ;;
+esac
+
+execute=false
+requested=''
+while (($#)); do
+    case "$1" in
+        --execute) execute=true; shift ;;
+        --version)
+            [[ $# -ge 2 && -z $requested ]] || fail 'specify --version VERSION once'
+            stable_version "$2" || fail '--version must be a stable semantic version'
+            requested=$2; shift 2 ;;
+        -h|--help)
+            printf 'Usage: scripts/release [--execute] [--version VERSION]\n\nPreview by default. --execute stamps, commits, tags, and pushes a release.\n'
+            exit 0 ;;
+        *) fail "unknown argument: $1" ;;
+    esac
+done
+
+current=$(manifest_version)
+stable_version "$current" || fail 'Cargo.toml must contain a stable version'
+level=$(changelog level)
+IFS=. read -r major minor patch <<<"$current"
+# Keep shell arithmetic within a predictable range.
+for component in "$major" "$minor" "$patch"; do
+    ((${#component} <= 9)) || fail 'version component exceeds supported range'
+done
+if ((level == 3 && major > 0)); then
+    next="$((major + 1)).0.0"
+elif ((level >= 2)); then
+    next="$major.$((minor + 1)).0"
+else
+    next="$major.$minor.$((patch + 1))"
+fi
+if [[ -n $requested ]]; then
+    stable_version "$requested" || fail '--version must be a stable semantic version'
+    IFS=. read -r a b c <<<"$requested"
+    for component in "$a" "$b" "$c"; do
+        ((${#component} <= 9)) || fail 'version component exceeds supported range'
+    done
+    IFS=. read -r x y z <<<"$next"
+    ((a > x || (a == x && b > y) || (a == x && b == y && c >= z))) || fail "explicit version must be at least inferred version $next"
+    next=$requested
+fi
+tag="fransson-v$next"
+printf 'Release: %s → %s (%s)\n' "$current" "$next" "$tag"
+changelog stamp "$next" "$(date -u +%F)" >/dev/null
+if [[ $execute == false ]]; then
+    printf 'Preview only; no files, commits, tags, or remote refs changed.\nRun scripts/release --execute%s to release.\n' "${requested:+ --version $requested}"
+    exit 0
+fi
+
+[[ $(git branch --show-current) == master ]] || fail 'releases must run on master'
+[[ -z $(git status --porcelain --untracked-files=all) ]] || fail 'working tree must be clean, including untracked files'
+[[ $(git rev-parse --abbrev-ref '@{upstream}') == origin/master ]] || fail 'master must track origin/master'
+git fetch origin master
+[[ $(git rev-parse HEAD) == "$(git rev-parse FETCH_HEAD)" && $(git rev-parse HEAD) == "$(git rev-parse origin/master)" ]] || fail 'master must match origin/master; push normal work first'
+if git show-ref --verify --quiet "refs/tags/$tag"; then fail "tag $tag already exists locally"; fi
+remote_tag=$(git ls-remote --tags origin "refs/tags/$tag")
+[[ -z $remote_tag ]] || fail "tag $tag already exists remotely"
+command -v cargo-release >/dev/null || fail 'cargo-release is required; enter nix develop'
+# Explicit steps avoid the all-in-one command's crates.io ownership lookup,
+# which runs even with publish=false in cargo-release 1.1.1.
+# Never apply user-global cargo-release settings to this repository.
+for step in version hook commit tag push; do
+    args=("$step")
+    if [[ $step == version ]]; then args+=("$next"); fi
+    if ! cargo release "${args[@]}" --isolated --config "$script_dir/../release.toml" --execute --no-confirm; then
+        printf 'Release stopped during %s. Inspect git status, git log, and local/remote tags before retrying.\n' "$step" >&2
+        printf '%s\n' 'Do not move or delete published tags. See CONTRIBUTING.md for recovery.' >&2
+        exit 1
+    fi
+done
